@@ -1,0 +1,21 @@
+# Install: sudo cp dist/logrotate.d/brahma /etc/logrotate.d/brahma
+#
+# After installing, edit the path on the first line and the `su` line to
+# match your user. Test with:
+#   sudo logrotate --debug /etc/logrotate.d/brahma
+#
+# copytruncate is used so brahma does not need to handle SIGHUP to reopen
+# its log file. There is a tiny window during truncation where writes may
+# be lost, which is fine for this volume (~5 KB/day).
+
+/home/youruser/.local/state/bramha/brahma.log {
+    daily
+    rotate 14
+    size 10M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su youruser youruser
+}

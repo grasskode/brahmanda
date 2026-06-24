@@ -1,0 +1,25 @@
+# Simplest possible bramha config: two independent pipelines, each
+# running the same "fake jobs" worker. Run it from the repo root:
+#
+#   brahma examples/simple/config.yaml
+#   chitra --watch 2s          # in another terminal
+#
+# `alpha` keeps two workers busy at once; `beta` keeps one. Together
+# they show pool sizing, lazy fill, and how succeeded/failed outcomes
+# land in the journal and roll up per pipeline in chitra.
+
+state_dir: ~/.local/state/bramha-demo
+log_file: ""    # empty = stderr
+
+pipelines:
+  - name: alpha
+    pool_size: 2
+    tick_interval: 5s
+    step_timeout: 30s
+    command: ./examples/simple/worker.sh
+
+  - name: beta
+    pool_size: 1
+    tick_interval: 8s
+    step_timeout: 30s
+    command: ./examples/simple/worker.sh

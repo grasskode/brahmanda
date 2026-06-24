@@ -1,0 +1,7 @@
+bin/
+*.test
+*.out
+.DS_Store
+
+# Machine-local Claude Code settings (absolute paths, personal allowlists)
+.claude/settings.local.json

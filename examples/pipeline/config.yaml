@@ -1,0 +1,41 @@
+# A three-stage delivery pipeline: build -> test -> deploy.
+#
+# All three pipelines run the same stage.sh; each behaves differently
+# based on the pipeline name srishti passes in as $AGENT_PIPELINE. Work
+# flows between stages through a shared queue under the state dir, so a
+# single change id is tracked across all three stages.
+#
+# Run it from the repo root:
+#
+#   brahma examples/pipeline/config.yaml
+#   chitra --watch 2s          # in another terminal — watch the chains form
+#
+# Things to watch in chitra:
+#   * the TASKS panel shows one chain per change: build ✓ → test ✓ → deploy ✓
+#   * changes that fail at `test` stop there (build ✓ → test ✗) — conditional advancement
+#   * `test` runs pool_size 2, so several changes are in flight at once
+#   * the PIPELINES table shows RAN / RUN/CAP / ERR per stage
+#
+# `build` mints work every tick; tune its tick_interval to change throughput.
+
+state_dir: ~/.local/state/bramha-demo
+log_file: ""
+
+pipelines:
+  - name: build
+    pool_size: 1
+    tick_interval: 8s
+    step_timeout: 1m
+    command: ./examples/pipeline/stage.sh
+
+  - name: test
+    pool_size: 2
+    tick_interval: 4s
+    step_timeout: 1m
+    command: ./examples/pipeline/stage.sh
+
+  - name: deploy
+    pool_size: 1
+    tick_interval: 6s
+    step_timeout: 1m
+    command: ./examples/pipeline/stage.sh
