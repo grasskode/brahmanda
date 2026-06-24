@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -32,6 +33,16 @@ type Config struct {
 	// LogFile is the orchestrator's own log destination. Empty = stderr.
 	LogFile string `yaml:"log_file"`
 
+	// EnvFile is an optional path to a dotenv-style KEY=value file whose
+	// entries are exported into every worker's environment, across all
+	// pipelines. One assignment per line; blank lines and lines starting
+	// with '#' are ignored; an optional surrounding pair of quotes is
+	// stripped; a leading `export ` is tolerated. A relative path resolves
+	// against the config file's directory. These values take precedence
+	// over brahma's inherited process environment. AGENT_* names are
+	// reserved for the runner and rejected.
+	EnvFile string `yaml:"env_file"`
+
 	// Pipelines is the list of pipelines the orchestrator runs. Required;
 	// at least one entry. Names must be unique.
 	Pipelines []Spec `yaml:"pipelines"`
@@ -39,6 +50,10 @@ type Config struct {
 	// SourcePath records the file Config was loaded from. Set by
 	// LoadFile; not part of the YAML schema.
 	SourcePath string `yaml:"-"`
+
+	// Env is the resolved environment parsed from EnvFile. Populated by
+	// LoadFile; not settable directly in YAML — declare an env_file.
+	Env map[string]string `yaml:"-"`
 }
 
 // Spec is one pipeline's declaration. Optional fields receive defaults
@@ -95,6 +110,9 @@ func LoadFile(path string) (*Config, error) {
 	}
 	cfg.SourcePath = path
 	if err := cfg.applyDefaults(); err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if err := cfg.loadEnvFile(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	if err := cfg.validate(); err != nil {
@@ -176,6 +194,94 @@ func (s *Spec) validate() error {
 		return fmt.Errorf("command is required")
 	}
 	return nil
+}
+
+// envKeyRE bounds an environment variable name to a POSIX-shell-safe
+// identifier so a malformed key can't smuggle anything past `KEY=value`.
+var envKeyRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// loadEnvFile reads EnvFile (when set) into the resolved Env map. A
+// relative path is taken relative to the config file's directory so a
+// config is portable. No-op when EnvFile is empty.
+func (c *Config) loadEnvFile() error {
+	if c.EnvFile == "" {
+		return nil
+	}
+	p := expandHome(c.EnvFile)
+	if !filepath.IsAbs(p) && c.SourcePath != "" {
+		p = filepath.Join(filepath.Dir(c.SourcePath), p)
+	}
+	env, err := parseEnvFile(p)
+	if err != nil {
+		return fmt.Errorf("env_file %s: %w", c.EnvFile, err)
+	}
+	c.Env = env
+	return nil
+}
+
+// parseEnvFile reads a dotenv-style KEY=value file. Blank lines and
+// lines starting with '#' are ignored, a leading `export ` is tolerated,
+// surrounding quotes are stripped, and keys are validated. It is not a
+// shell: there is no variable interpolation or command substitution.
+func parseEnvFile(path string) (map[string]string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	for i, line := range strings.Split(string(raw), "\n") {
+		s := strings.TrimSpace(line)
+		if s == "" || strings.HasPrefix(s, "#") {
+			continue
+		}
+		s = strings.TrimPrefix(s, "export ")
+		rawKey, rawVal, ok := strings.Cut(s, "=")
+		if !ok {
+			return nil, fmt.Errorf("line %d: expected KEY=value, got %q", i+1, s)
+		}
+		key := strings.TrimSpace(rawKey)
+		val := stripQuotes(strings.TrimSpace(rawVal))
+		if err := validateEnvKey(key); err != nil {
+			return nil, fmt.Errorf("line %d: %w", i+1, err)
+		}
+		out[key] = val
+	}
+	return out, nil
+}
+
+// validateEnvKey rejects names that aren't shell-safe identifiers and
+// the AGENT_* namespace, which the runner owns and injects itself.
+func validateEnvKey(key string) error {
+	if !envKeyRE.MatchString(key) {
+		return fmt.Errorf("invalid env name %q (must match [A-Za-z_][A-Za-z0-9_]*)", key)
+	}
+	if strings.HasPrefix(key, "AGENT_") {
+		return fmt.Errorf("env name %q is reserved (AGENT_* is injected by the runner)", key)
+	}
+	return nil
+}
+
+// stripQuotes removes one matching pair of surrounding single or double
+// quotes, if present. Unquoted values pass through unchanged.
+func stripQuotes(s string) string {
+	if len(s) >= 2 {
+		if (s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'') {
+			return s[1 : len(s)-1]
+		}
+	}
+	return s
+}
+
+// WorkerEnvPairs returns the resolved env as sorted KEY=value strings,
+// ready to overlay onto a worker's process environment. Empty when no
+// env_file was configured.
+func (c *Config) WorkerEnvPairs() []string {
+	pairs := make([]string, 0, len(c.Env))
+	for k, v := range c.Env {
+		pairs = append(pairs, k+"="+v)
+	}
+	sort.Strings(pairs)
+	return pairs
 }
 
 // expandHome rewrites a leading ~ or ~/ in p to the user's home dir.

@@ -198,6 +198,84 @@ func TestLoadFile_ExampleConfig(t *testing.T) {
 	}
 }
 
+func TestLoadFile_EnvFile(t *testing.T) {
+	dir := t.TempDir()
+	writeConfig(t, dir, "worker.env", `
+# a comment
+LOG_LEVEL=debug
+export REGION="eu-west-1"
+EMPTY=
+QUOTED='spaced value'
+`)
+	path := writeConfig(t, dir, "config.yaml", `
+state_dir: /tmp/test-state
+env_file: worker.env
+pipelines:
+  - name: build
+    command: ./build
+`)
+	cfg, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	want := map[string]string{
+		"LOG_LEVEL": "debug",
+		"REGION":    "eu-west-1",
+		"EMPTY":     "",
+		"QUOTED":    "spaced value",
+	}
+	for k, v := range want {
+		if cfg.Env[k] != v {
+			t.Errorf("Env[%q] = %q, want %q", k, cfg.Env[k], v)
+		}
+	}
+	// WorkerEnvPairs is sorted KEY=value.
+	pairs := cfg.WorkerEnvPairs()
+	if len(pairs) != len(want) {
+		t.Fatalf("WorkerEnvPairs len = %d, want %d (%v)", len(pairs), len(want), pairs)
+	}
+	if pairs[0] != "EMPTY=" {
+		t.Errorf("WorkerEnvPairs not sorted: %v", pairs)
+	}
+}
+
+func TestLoadFile_EnvFileRejectsReservedAndMalformed(t *testing.T) {
+	cases := map[string]string{
+		"reserved AGENT_ prefix": "AGENT_PIPELINE=oops\n",
+		"invalid identifier":     "1BAD=x\n",
+		"missing equals":         "NOEQUALS\n",
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeConfig(t, dir, "worker.env", body)
+			path := writeConfig(t, dir, "config.yaml", `
+state_dir: /tmp/test-state
+env_file: worker.env
+pipelines:
+  - name: build
+    command: ./build
+`)
+			if _, err := LoadFile(path); err == nil {
+				t.Fatalf("LoadFile accepted bad env_file (%s)", name)
+			}
+		})
+	}
+}
+
+func TestLoadFile_MissingEnvFile(t *testing.T) {
+	path := writeConfig(t, t.TempDir(), "config.yaml", `
+state_dir: /tmp/test-state
+env_file: does-not-exist.env
+pipelines:
+  - name: build
+    command: ./build
+`)
+	if _, err := LoadFile(path); err == nil {
+		t.Fatal("LoadFile accepted a missing env_file")
+	}
+}
+
 func names(cfg *Config) []string {
 	out := make([]string, len(cfg.Pipelines))
 	for i, p := range cfg.Pipelines {

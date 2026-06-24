@@ -100,11 +100,15 @@ func run(configPath string) error {
 	}
 	defer removeRuntimeFile(cfg.StateDir)
 
+	workerEnv := cfg.WorkerEnvPairs()
+
 	log.Info("brahma starting",
 		"config", configPath,
 		"state_dir", cfg.StateDir,
 		"pipelines", len(cfg.Pipelines),
 		"runner", runnerPath,
+		"env_file", cfg.EnvFile,
+		"worker_env_vars", len(workerEnv),
 		"pid", os.Getpid(),
 	)
 
@@ -119,7 +123,7 @@ func run(configPath string) error {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			runPipeline(ctx, log, logOut, cfg.StateDir, runnerPath, spec)
+			runPipeline(ctx, log, logOut, cfg.StateDir, runnerPath, spec, workerEnv)
 		}()
 	}
 	wg.Wait()
@@ -131,7 +135,7 @@ func run(configPath string) error {
 // at startup, then once per tick_interval. Each fire spawns one runner
 // if running < pool_size; otherwise it's a no-op. On context cancel,
 // stops firing and waits for in-flight runners to drain.
-func runPipeline(ctx context.Context, log *slog.Logger, logOut io.Writer, stateDir, runnerPath string, spec pipelinespec.Spec) {
+func runPipeline(ctx context.Context, log *slog.Logger, logOut io.Writer, stateDir, runnerPath string, spec pipelinespec.Spec, workerEnv []string) {
 	pLog := log.With("pipeline", spec.Name)
 	pLog.Info("pipeline ready",
 		"pool_size", spec.PoolSize,
@@ -153,7 +157,7 @@ func runPipeline(ctx context.Context, log *slog.Logger, logOut io.Writer, stateD
 		go func() {
 			defer workers.Done()
 			defer running.Add(-1)
-			spawnWorker(ctx, pLog, logOut, stateDir, runnerPath, spec, slot)
+			spawnWorker(ctx, pLog, logOut, stateDir, runnerPath, spec, slot, workerEnv)
 		}()
 	}
 
@@ -181,7 +185,7 @@ func runPipeline(ctx context.Context, log *slog.Logger, logOut io.Writer, stateD
 // A sibling <worker_id>.pid file holds the runner PID for the
 // monitor's liveness check, removed on exit so a stale file can't
 // claim a now-recycled PID belongs to a worker.
-func spawnWorker(ctx context.Context, log *slog.Logger, logOut io.Writer, stateDir, runnerPath string, spec pipelinespec.Spec, slot int) {
+func spawnWorker(ctx context.Context, log *slog.Logger, logOut io.Writer, stateDir, runnerPath string, spec pipelinespec.Spec, slot int, workerEnv []string) {
 	workerID := uuid.NewString()[:8]
 	wLog := log.With("worker", workerID, "slot", slot)
 
@@ -210,6 +214,10 @@ func spawnWorker(ctx context.Context, log *slog.Logger, logOut io.Writer, stateD
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Overlay the config-declared env on top of brahma's inherited
+	// process environment; config wins on key collisions. srishti
+	// inherits this and passes it to the worker (then adds AGENT_*).
+	cmd.Env = workerEnviron(workerEnv)
 
 	start := time.Now()
 	if err := cmd.Start(); err != nil {
@@ -289,6 +297,37 @@ func writeRuntimeFile(cfg *pipelinespec.Config, configPath, runnerPath string) e
 
 func removeRuntimeFile(stateDir string) {
 	_ = os.Remove(runtimeFilePath(stateDir))
+}
+
+// workerEnviron returns brahma's process environment with extra (the
+// config-declared KEY=value pairs) overlaid on top, so a config value
+// wins over an inherited one. Deduped by key — glibc's getenv returns
+// the first match, so a plain append wouldn't reliably override.
+func workerEnviron(extra []string) []string {
+	if len(extra) == 0 {
+		return os.Environ()
+	}
+	idx := map[string]int{}
+	var out []string
+	add := func(pair string) {
+		key, _, ok := strings.Cut(pair, "=")
+		if !ok {
+			return
+		}
+		if i, seen := idx[key]; seen {
+			out[i] = pair
+			return
+		}
+		idx[key] = len(out)
+		out = append(out, pair)
+	}
+	for _, p := range os.Environ() {
+		add(p)
+	}
+	for _, p := range extra {
+		add(p)
+	}
+	return out
 }
 
 // resolveRunner finds the srishti runner binary. Priority: $SRISHTI_BIN,

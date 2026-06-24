@@ -172,6 +172,7 @@ throwaway `~/.local/state/bramha-demo` state dir:
 ```yaml
 state_dir: ~/.local/state/bramha   # journal + worker state live here
 log_file: ""                       # brahma's own log; empty = stderr
+env_file: ./worker.env             # optional; env exported to every worker
 pipelines:
   - name: build                    # kebab-case, unique
     pool_size: 1                   # max concurrent workers (default 1)
@@ -180,8 +181,27 @@ pipelines:
     command: ./examples/pipeline/stage.sh
 ```
 
-Account secrets (tokens, etc.) are **not** part of the config — put them in the
-operator's shell env and they propagate to every worker automatically.
+### Worker environment
+
+Workers inherit brahma's own process environment, so the simplest way to pass
+something to every worker is to export it before starting brahma. To keep it
+centralized in the config instead, point `env_file` at a dotenv-style file:
+
+```ini
+# worker.env — one KEY=value per line; '#' comments and blank lines ignored,
+# a leading `export ` is tolerated, surrounding quotes are stripped.
+LOG_LEVEL=debug
+GITHUB_TOKEN=ghp_xxx
+REGION="eu-west-1"
+```
+
+- A relative `env_file` path resolves against the config file's directory.
+- These values **override** anything brahma inherited from its own environment.
+- `AGENT_*` names are reserved (the runner injects them) and rejected.
+- It is not a shell: no `$VAR` interpolation or command substitution.
+
+Keep the env file out of version control (it usually holds secrets) and
+`chmod 600` it. brahma reads it at startup, so restart brahma after editing it.
 
 ## State layout
 
