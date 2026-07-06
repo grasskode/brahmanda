@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/grasskode/brahmanda/internal/state"
 )
 
 // Config is the orchestrator's complete declarative input. Loaded from
@@ -27,7 +29,7 @@ import (
 type Config struct {
 	// StateDir holds the journal (<dir>/journal.jsonl) and per-worker
 	// state (<dir>/workers/<pipeline>/<id>/). Defaults to
-	// $XDG_STATE_HOME/brahma (or ~/.local/state/brahma).
+	// $XDG_STATE_HOME/brahmanda (or ~/.local/state/brahmanda).
 	StateDir string `yaml:"state_dir"`
 
 	// LogFile is the orchestrator's own log destination. Empty = stderr.
@@ -123,15 +125,11 @@ func LoadFile(path string) (*Config, error) {
 
 func (c *Config) applyDefaults() error {
 	if c.StateDir == "" {
-		dir := os.Getenv("XDG_STATE_HOME")
-		if dir == "" {
-			home, err := os.UserHomeDir()
-			if err != nil {
-				return fmt.Errorf("resolve home dir: %w", err)
-			}
-			dir = filepath.Join(home, ".local", "state")
+		sd, err := state.DefaultStateDir()
+		if err != nil {
+			return err
 		}
-		c.StateDir = filepath.Join(dir, "brahma")
+		c.StateDir = sd
 	} else {
 		c.StateDir = expandHome(c.StateDir)
 	}

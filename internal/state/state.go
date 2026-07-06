@@ -58,6 +58,25 @@ func LockPath(root string) string {
 	return filepath.Join(root, "brahma.lock")
 }
 
+// DefaultStateDirName is the state-dir basename used when a config sets
+// none. Shared by the orchestrator (brahma) and the monitor (chitra) so
+// their defaults can't drift apart.
+const DefaultStateDirName = "brahmanda"
+
+// DefaultStateDir returns the state dir used when the config sets none:
+// $XDG_STATE_HOME/brahmanda, or ~/.local/state/brahmanda when unset.
+func DefaultStateDir() (string, error) {
+	dir := os.Getenv("XDG_STATE_HOME")
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve home dir: %w", err)
+		}
+		dir = filepath.Join(home, ".local", "state")
+	}
+	return filepath.Join(dir, DefaultStateDirName), nil
+}
+
 // ClaudeErrorMarkerPath is the file workers touch when claudex.Run
 // returns any error (rate limit, API unavailability, connection
 // failure, skill couldn't complete, etc.). The orchestrator checks for

@@ -8,7 +8,7 @@
 # they show pool sizing, lazy fill, and how succeeded/failed outcomes
 # land in the journal and roll up per pipeline in chitra.
 
-state_dir: ~/.local/state/brahma-demo
+state_dir: ~/.local/state/brahmanda-demo
 log_file: ""    # empty = stderr
 
 pipelines:

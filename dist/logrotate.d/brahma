@@ -8,7 +8,7 @@
 # its log file. There is a tiny window during truncation where writes may
 # be lost, which is fine for this volume (~5 KB/day).
 
-/home/youruser/.local/state/brahma/brahma.log {
+/home/youruser/.local/state/brahmanda/brahma.log {
     daily
     rotate 14
     size 10M

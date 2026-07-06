@@ -150,7 +150,7 @@ binary, then `srishti` on `$PATH`.
 ## Examples
 
 Two runnable examples live under [`examples/`](examples), both writing to a
-throwaway `~/.local/state/brahma-demo` state dir:
+throwaway `~/.local/state/brahmanda-demo` state dir:
 
 - **[`examples/simple`](examples/simple)** — fake jobs. Two independent pipelines
   run a worker that picks a random task and succeeds ~70% of the time. Shows pool
@@ -191,7 +191,7 @@ throwaway `~/.local/state/brahma-demo` state dir:
 ## Config
 
 ```yaml
-state_dir: ~/.local/state/brahma   # journal + worker state live here
+state_dir: ~/.local/state/brahmanda   # journal + worker state live here
 log_file: ""                       # brahma's own log; empty = stderr
 env_file: ./worker.env             # optional; env exported to every worker
 pipelines:

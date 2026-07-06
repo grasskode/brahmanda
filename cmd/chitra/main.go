@@ -13,16 +13,16 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/grasskode/brahmanda/internal/agentui"
+	"github.com/grasskode/brahmanda/internal/state"
 )
 
 func main() {
-	stateRoot := flag.String("state-dir", defaultStateDir(), "brahma state dir (defaults to $XDG_STATE_HOME/brahma)")
+	stateRoot := flag.String("state-dir", defaultStateDir(), "brahmanda state dir (defaults to $XDG_STATE_HOME/brahmanda)")
 	worktreesRoot := flag.String("worktrees-root", "", "override worktrees root (default: from <state_dir>/runtime.yaml or $WORKTREES_ROOT)")
 	since := flag.String("since", "today", "lookback: 'today' (local midnight), 'all' (no cutoff), or a duration like '6h' / '7d'")
 	workerTimeout := flag.Duration("worker-timeout", 1*time.Hour, "lock files older than this are flagged as stale")
@@ -56,13 +56,9 @@ func main() {
 }
 
 func defaultStateDir() string {
-	dir := os.Getenv("XDG_STATE_HOME")
-	if dir == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return "."
-		}
-		dir = filepath.Join(home, ".local", "state")
+	dir, err := state.DefaultStateDir()
+	if err != nil {
+		return "."
 	}
-	return filepath.Join(dir, "brahma")
+	return dir
 }

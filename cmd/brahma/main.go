@@ -59,6 +59,13 @@ func run(configPath string) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	// Overlay the env_file values onto brahma's own environment so its
+	// runtime env matches what workers see. Anything reading os.Getenv
+	// afterwards (runtime.yaml, diagnostics) resolves config-declared
+	// vars, not just those exported in brahma's shell.
+	if err := applyConfigEnv(cfg); err != nil {
+		return fmt.Errorf("apply env_file: %w", err)
+	}
 	if err := os.MkdirAll(cfg.StateDir, 0o755); err != nil {
 		return fmt.Errorf("create state dir: %w", err)
 	}
@@ -297,6 +304,20 @@ func writeRuntimeFile(cfg *pipelinespec.Config, configPath, runnerPath string) e
 
 func removeRuntimeFile(stateDir string) {
 	_ = os.Remove(runtimeFilePath(stateDir))
+}
+
+// applyConfigEnv exports the env_file-declared values into brahma's own
+// process environment, so os.Getenv resolves them the same way workers
+// do. Config values take precedence over the inherited shell environment,
+// matching workerEnviron's overlay ordering. No-op when no env_file was
+// configured.
+func applyConfigEnv(cfg *pipelinespec.Config) error {
+	for k, v := range cfg.Env {
+		if err := os.Setenv(k, v); err != nil {
+			return fmt.Errorf("set %s: %w", k, err)
+		}
+	}
+	return nil
 }
 
 // workerEnviron returns brahma's process environment with extra (the

@@ -29,6 +29,13 @@ func Acquire(path string) (*File, error) {
 		}
 		return nil, fmt.Errorf("flock %s: %w", path, err)
 	}
+	// Truncate before writing: the file may carry a prior holder's PID,
+	// and a shorter new PID would otherwise leave its trailing bytes in
+	// place (e.g. a low post-reboot PID over a stale longer one).
+	if err := f.Truncate(0); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("truncate lockfile %s: %w", path, err)
+	}
 	if _, err := fmt.Fprintf(f, "%d\n", os.Getpid()); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("write pid: %w", err)
