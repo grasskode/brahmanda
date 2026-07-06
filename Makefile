@@ -4,7 +4,7 @@ INSTALL_DIR ?= $(HOME)/.local/bin
 
 .PHONY: build brahma srishti chitra install vet test tidy fmt clean help
 
-# bramha — a config-driven pipeline orchestrator. Three binaries:
+# brahma — a config-driven pipeline orchestrator. Three binaries:
 #   * brahma  — the creator: long-running daemon. Loads config.yaml and
 #               lazy-fills each pipeline's worker pool by exec'ing srishti.
 #   * srishti — the runner: short-lived, one per worker. Execs the pipeline

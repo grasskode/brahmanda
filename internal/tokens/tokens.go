@@ -50,7 +50,7 @@ func (u *Usage) Add(other Usage) {
 type Session struct {
 	SessionID string
 	Phase     string    // step name from sessions.yaml: investigate, implement, ...
-	TaskID    string    // identifier the session ran under (QUA-345 / karan--QUA-345)
+	TaskID    string    // identifier the session ran under (e.g. CHG-42 / user--CHG-42)
 	StartedAt time.Time // timestamp recorded in sessions.yaml
 	Usage     Usage
 	Cost      float64 // USD, 0 when ccusage unavailable or session unknown to ccusage

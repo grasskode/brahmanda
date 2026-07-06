@@ -18,7 +18,7 @@
 #
 # `build` mints work every tick; tune its tick_interval to change throughput.
 
-state_dir: ~/.local/state/bramha-demo
+state_dir: ~/.local/state/brahma-demo
 log_file: ""
 
 pipelines:

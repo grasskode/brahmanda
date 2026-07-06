@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/grasskode/bramha/internal/journal"
+	"github.com/grasskode/brahmanda/internal/journal"
 )
 
 // writeScript writes a #!/bin/sh script into a tempdir and returns its

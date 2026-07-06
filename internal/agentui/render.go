@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/grasskode/bramha/internal/journal"
-	"github.com/grasskode/bramha/internal/tokens"
+	"github.com/grasskode/brahmanda/internal/journal"
+	"github.com/grasskode/brahmanda/internal/tokens"
 )
 
 // Render writes a plain-text snapshot to w. Used by the one-shot mode

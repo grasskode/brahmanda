@@ -2,7 +2,7 @@
 # stage.sh — one script, three behaviours, selected by $AGENT_PIPELINE.
 #
 # This is a self-contained mini software-delivery pipeline that shows off
-# what bramha is actually for: a unit of work flowing through several
+# what brahma is actually for: a unit of work flowing through several
 # stages, each stage its own pool, with conditional advancement between
 # them. No real build system is involved — every step is a sleep + a coin
 # flip — but the shape mirrors a real agent-workers pipeline (the

@@ -7,7 +7,7 @@
 # real system — handy for watching the journal fill up and seeing how
 # failures surface in the monitor.
 #
-# A worker talks to bramha purely over stdout: each line is one NDJSON
+# A worker talks to brahma purely over stdout: each line is one NDJSON
 # journal event. Only "task_id" is required; srishti fills in the rest.
 # Everything written to stderr is captured to the worker log but is NOT
 # parsed as an event.
@@ -15,7 +15,7 @@
 # Env injected by srishti (all four are always present):
 #   AGENT_PIPELINE     — pipeline name from the spec
 #   AGENT_WORKER_ID    — unique invocation ID
-#   AGENT_STATE_ROOT   — bramha state dir
+#   AGENT_STATE_ROOT   — brahma state dir
 #   AGENT_WORKER_INDEX — pool slot (0..pool_size-1)
 
 set -eu

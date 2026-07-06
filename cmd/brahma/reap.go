@@ -11,7 +11,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/grasskode/bramha/internal/journal"
+	"github.com/grasskode/brahmanda/internal/journal"
 )
 
 // reapOrphans reconciles the journal at startup. A worker that logged a

@@ -25,7 +25,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/grasskode/bramha/internal/journal"
+	"github.com/grasskode/brahmanda/internal/journal"
 )
 
 // Config is the runner's complete input for one invocation.

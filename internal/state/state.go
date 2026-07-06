@@ -101,8 +101,8 @@ func (d *Dir) SetStatus(taskID, status string) error {
 }
 
 // WriteWorktreePath records where the worker's worktree lives. Called by
-// the worker as soon as synqgwt returns; the orchestrator reads this on
-// reap to locate the .agent/ folder for archiving.
+// the worker as soon as its worktree is ready; the orchestrator reads
+// this on reap to locate the .agent/ folder for archiving.
 func (d *Dir) WriteWorktreePath(taskID, path string) error {
 	dst := filepath.Join(d.WorkerDir(taskID), "worktree")
 	return os.WriteFile(dst, []byte(path+"\n"), 0o644)
@@ -114,7 +114,7 @@ type Worker struct {
 	PID          int
 	StartedAt    time.Time
 	Status       string
-	WorktreePath string // empty if the worker died before synqgwt finished
+	WorktreePath string // empty if the worker died before its worktree was ready
 }
 
 // List returns every worker subdir in this pool, regardless of status.

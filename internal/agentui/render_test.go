@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/grasskode/bramha/internal/journal"
-	"github.com/grasskode/bramha/internal/tokens"
+	"github.com/grasskode/brahmanda/internal/journal"
+	"github.com/grasskode/brahmanda/internal/tokens"
 )
 
 func TestResolveSinceMovesWithClock(t *testing.T) {

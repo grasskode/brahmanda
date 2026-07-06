@@ -17,8 +17,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/grasskode/bramha/internal/journal"
-	"github.com/grasskode/bramha/internal/runner"
+	"github.com/grasskode/brahmanda/internal/journal"
+	"github.com/grasskode/brahmanda/internal/runner"
 )
 
 func main() {

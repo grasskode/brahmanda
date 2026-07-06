@@ -27,7 +27,7 @@ import (
 type Config struct {
 	// StateDir holds the journal (<dir>/journal.jsonl) and per-worker
 	// state (<dir>/workers/<pipeline>/<id>/). Defaults to
-	// $XDG_STATE_HOME/bramha (or ~/.local/state/bramha).
+	// $XDG_STATE_HOME/brahma (or ~/.local/state/brahma).
 	StateDir string `yaml:"state_dir"`
 
 	// LogFile is the orchestrator's own log destination. Empty = stderr.
@@ -131,7 +131,7 @@ func (c *Config) applyDefaults() error {
 			}
 			dir = filepath.Join(home, ".local", "state")
 		}
-		c.StateDir = filepath.Join(dir, "bramha")
+		c.StateDir = filepath.Join(dir, "brahma")
 	} else {
 		c.StateDir = expandHome(c.StateDir)
 	}

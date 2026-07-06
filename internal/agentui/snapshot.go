@@ -29,10 +29,10 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/grasskode/bramha/internal/journal"
-	"github.com/grasskode/bramha/internal/lock"
-	"github.com/grasskode/bramha/internal/state"
-	"github.com/grasskode/bramha/internal/tokens"
+	"github.com/grasskode/brahmanda/internal/journal"
+	"github.com/grasskode/brahmanda/internal/lock"
+	"github.com/grasskode/brahmanda/internal/state"
+	"github.com/grasskode/brahmanda/internal/tokens"
 )
 
 // Snapshot is one frame of monitor state.

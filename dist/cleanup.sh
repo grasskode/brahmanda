@@ -1,16 +1,16 @@
 #!/bin/sh
 # cleanup.sh — drops journal files older than $RETENTION_DAYS (default 30)
-# from the bramha state directory.
+# from the brahma state directory.
 #
 # Cron it:
 #
-#   30 4 * * *  BRAHMA_STATE_DIR=$HOME/.local/state/bramha \
-#               /usr/local/share/bramha/cleanup.sh
+#   30 4 * * *  BRAHMA_STATE_DIR=$HOME/.local/state/brahma \
+#               /usr/local/share/brahma/cleanup.sh
 #
 # Env knobs (all optional):
 #
-#   BRAHMA_STATE_DIR  — state root (default: $XDG_STATE_HOME/bramha
-#                       or ~/.local/state/bramha)
+#   BRAHMA_STATE_DIR  — state root (default: $XDG_STATE_HOME/brahma
+#                       or ~/.local/state/brahma)
 #   RETENTION_DAYS    — drop journal files with mtime older than this (default 30)
 #   DRY_RUN           — set to any non-empty value to print what would be
 #                       deleted without deleting anything
@@ -20,7 +20,7 @@
 
 set -eu
 
-state_dir="${BRAHMA_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/bramha}"
+state_dir="${BRAHMA_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/brahma}"
 retention="${RETENTION_DAYS:-30}"
 journal_dir="$state_dir/journal"
 

@@ -11,7 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/grasskode/bramha/internal/journal"
+	"github.com/grasskode/brahmanda/internal/journal"
 )
 
 // PanelID identifies the toggleable sections in the --watch TUI.

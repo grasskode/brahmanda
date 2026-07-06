@@ -3,10 +3,10 @@
 # Install (per-user, no root needed):
 #
 #   make install                                   # puts brahma/srishti/chitra in ~/.local/bin
-#   mkdir -p ~/.config/bramha ~/.config/systemd/user
+#   mkdir -p ~/.config/brahma ~/.config/systemd/user
 #   cp dist/systemd/brahma.service ~/.config/systemd/user/brahma.service
-#   cp <your config>.yaml ~/.config/bramha/config.yaml
-#   # optional: put account secrets (GITHUB_TOKEN, etc.) in ~/.config/bramha/env
+#   cp <your config>.yaml ~/.config/brahma/config.yaml
+#   # optional: put account secrets (GITHUB_TOKEN, etc.) in ~/.config/brahma/env
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now brahma.service
 #
@@ -18,13 +18,13 @@
 
 [Unit]
 Description=brahma pipeline orchestrator
-Documentation=https://github.com/grasskode/bramha
+Documentation=https://github.com/grasskode/brahmanda
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/brahma %h/.config/bramha/config.yaml
+ExecStart=%h/.local/bin/brahma %h/.config/brahma/config.yaml
 
 # brahma resolves the runner as a sibling of its own binary, but pin it
 # explicitly so the service is robust to PATH changes.
@@ -35,7 +35,7 @@ Environment=SRISHTI_BIN=%h/.local/bin/srishti
 # NOT source ~/.profile, so anything brahma needs must come from here.
 # To set worker env centrally instead, use `env_file:` in the config —
 # those values override what's set here.
-EnvironmentFile=-%h/.config/bramha/env
+EnvironmentFile=-%h/.config/brahma/env
 
 # On stop, systemd sends SIGTERM to brahma, which stops spawning and
 # drains in-flight runners (each bounded by its own step_timeout) before

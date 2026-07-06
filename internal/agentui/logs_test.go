@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/grasskode/bramha/internal/journal"
+	"github.com/grasskode/brahmanda/internal/journal"
 )
 
 func TestDiscoverLogs_ResolvesTaskIDAndOrdersLiveFirst(t *testing.T) {

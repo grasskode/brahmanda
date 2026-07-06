@@ -39,8 +39,8 @@ import (
 	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
 
-	"github.com/grasskode/bramha/internal/lock"
-	"github.com/grasskode/bramha/internal/pipelinespec"
+	"github.com/grasskode/brahmanda/internal/lock"
+	"github.com/grasskode/brahmanda/internal/pipelinespec"
 )
 
 func main() {

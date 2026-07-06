@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/grasskode/bramha/internal/journal"
+	"github.com/grasskode/brahmanda/internal/journal"
 )
 
 // writeWorkerJournal writes the given events as one worker's .jsonl file.

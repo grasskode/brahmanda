@@ -1,4 +1,4 @@
-module github.com/grasskode/bramha
+module github.com/grasskode/brahmanda
 
 go 1.24.2
 

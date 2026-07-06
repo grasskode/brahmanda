@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/grasskode/bramha/internal/journal"
+	"github.com/grasskode/brahmanda/internal/journal"
 )
 
 // DefaultLiveAfter is the mtime-freshness threshold for tagging a
