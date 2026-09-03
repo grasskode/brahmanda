@@ -55,6 +55,17 @@ func RenderOrchestrator(w io.Writer, s Snapshot) {
 		styleOK.Render("running"),
 		nonEmpty(s.Orchestrator.PID, "?"),
 		styleDim.Render(s.Orchestrator.Since.Format(time.RFC3339)))
+	if s.MaxWorkers > 0 {
+		busy := 0
+		for _, p := range s.Pipelines {
+			busy += p.Running
+		}
+		if busy > s.MaxWorkers {
+			busy = s.MaxWorkers // global cap is enforced in-memory; clamp display too
+		}
+		fmt.Fprintf(w, "  %s %d / %d workers busy (round-robin across pipelines)\n",
+			styleDim.Render("POOL:"), busy, s.MaxWorkers)
+	}
 }
 
 func RenderBackoff(w io.Writer, s Snapshot) {
@@ -122,7 +133,7 @@ func renderPipelines(w io.Writer, s Snapshot, withTokens bool) {
 		for _, r := range s.Tokens.ByPhase {
 			tokensByPhase[r.Key] = r
 		}
-		costAvail = s.Tokens.CcusageEnabled
+		costAvail = s.Tokens.CostAvailable
 	}
 
 	// All fields strings so the TOTAL row can use dashes for slots
@@ -130,6 +141,12 @@ func renderPipelines(w io.Writer, s Snapshot, withTokens bool) {
 	baseHdr := "  %-22s %6s %5s %8s %5s %10s %10s"
 	baseRow := "  %-22s %6s %5s %8s %5s %10s %10s"
 	hdrArgs := []any{"PIPELINE", "TICK", "RAN", "RUN/CAP", "ERR", "LAST ERR", "LAST OK"}
+	withBudget := len(s.PipelineBudgets) > 0
+	if withBudget {
+		baseHdr += " %16s"
+		baseRow += " %16s"
+		hdrArgs = append(hdrArgs, "BUDGET")
+	}
 	if withTokens {
 		baseHdr += " %5s %7s %8s %7s"
 		baseRow += " %5s %7s %8s %7s"
@@ -185,6 +202,9 @@ func renderPipelines(w io.Writer, s Snapshot, withTokens bool) {
 			paddedRunCap = styleBusy.Render(paddedRunCap)
 		}
 		row := []any{p.Name, tick, strconv.Itoa(p.Ran), paddedRunCap, paddedErr, lastErr, lastOK}
+		if withBudget {
+			row = append(row, formatBudgetCell(s.PipelineBudgets[p.Name]))
+		}
 		if withTokens {
 			r, ok := tokensByPhase[p.Name]
 			sess, in, cacheR, out, cost := "-", "-", "-", "-", "-"
@@ -210,15 +230,58 @@ func renderPipelines(w io.Writer, s Snapshot, withTokens bool) {
 		fmt.Fprintf(w, baseRow, row...)
 	}
 
-	if !withTokens || len(s.Tokens.ByPhase) == 0 {
-		return
+	if withTokens && len(s.Tokens.ByPhase) > 0 {
+		totalArgs := []any{"TOTAL", "-", "-", "-", "-", "-", "-"}
+		if withBudget {
+			totalArgs = append(totalArgs, "-")
+		}
+		totalArgs = append(totalArgs, strconv.Itoa(totSess), FormatTokens(totIn), FormatTokens(totCacheR), FormatTokens(totOut))
+		if costAvail {
+			totalArgs = append(totalArgs, fmt.Sprintf("$%.2f", totCost))
+		}
+		fmt.Fprintf(w, baseRow, totalArgs...)
 	}
-	totalArgs := []any{"TOTAL", "-", "-", "-", "-", "-", "-",
-		strconv.Itoa(totSess), FormatTokens(totIn), FormatTokens(totCacheR), FormatTokens(totOut)}
-	if costAvail {
-		totalArgs = append(totalArgs, fmt.Sprintf("$%.2f", totCost))
+	renderBudgetNotes(w, s)
+}
+
+// formatBudgetCell renders "$<spent>/<cap>" padded to the BUDGET column,
+// highlighted when the cap is currently holding launches. "-" for a
+// pipeline without a budget.
+func formatBudgetCell(b BudgetStat) string {
+	if b.Limit.IsZero() {
+		return fmt.Sprintf("%16s", "-")
 	}
-	fmt.Fprintf(w, baseRow, totalArgs...)
+	cell := fmt.Sprintf("%16s", fmt.Sprintf("$%.2f/%s", b.Spent, b.Limit.String()))
+	if b.Exceeded {
+		return styleErr.Render(cell)
+	}
+	return cell
+}
+
+// renderBudgetNotes prints one line per budget that is currently
+// holding launches, saying when it resets. Silent when nothing is held.
+func renderBudgetNotes(w io.Writer, s Snapshot) {
+	note := func(scope string, b BudgetStat) {
+		if !b.Exceeded {
+			return
+		}
+		reset := "-"
+		if !b.ResetAt.IsZero() {
+			reset = fmt.Sprintf("in %s (%s)", compactDuration(time.Until(b.ResetAt).Round(time.Minute)), b.ResetAt.Local().Format("15:04"))
+		}
+		fmt.Fprintln(w, styleErr.Render(fmt.Sprintf("  budget: %s exceeded %s ($%.2f spent) — launches held, resets %s", scope, b.Limit.String(), b.Spent, reset)))
+	}
+	if s.GlobalBudget != nil {
+		note("all pipelines", *s.GlobalBudget)
+	}
+	names := make([]string, 0, len(s.PipelineBudgets))
+	for name := range s.PipelineBudgets {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		note(name, s.PipelineBudgets[name])
+	}
 }
 
 // compactDuration formats a tick interval as a short human label
@@ -766,7 +829,7 @@ func RenderTokens(w io.Writer, s Snapshot) {
 	}
 	header := "  %-22s %5s %7s %8s %8s %8s"
 	rowFmt := "  %-22s %5d %7s %8s %8s %8s"
-	if s.Tokens.CcusageEnabled {
+	if s.Tokens.CostAvailable {
 		header += " %9s"
 		rowFmt += " %9s"
 	}
@@ -774,7 +837,7 @@ func RenderTokens(w io.Writer, s Snapshot) {
 	rowFmt += "\n"
 
 	args := []any{"PHASE", "SESS", "INPUT", "CACHE_W", "CACHE_R", "OUTPUT"}
-	if s.Tokens.CcusageEnabled {
+	if s.Tokens.CostAvailable {
 		args = append(args, "COST")
 	}
 	fmt.Fprintf(w, header, args...)
@@ -792,7 +855,7 @@ func RenderTokens(w io.Writer, s Snapshot) {
 			FormatTokens(r.Usage.CacheReadTokens),
 			FormatTokens(r.Usage.OutputTokens),
 		}
-		if s.Tokens.CcusageEnabled {
+		if s.Tokens.CostAvailable {
 			fields = append(fields, fmt.Sprintf("$%.2f", r.Cost))
 		}
 		fmt.Fprintf(w, rowFmt, fields...)
@@ -814,7 +877,7 @@ func RenderTokens(w io.Writer, s Snapshot) {
 		FormatTokens(totCacheR),
 		FormatTokens(totOut),
 	}
-	if s.Tokens.CcusageEnabled {
+	if s.Tokens.CostAvailable {
 		totalFields = append(totalFields, fmt.Sprintf("$%.2f", totCost))
 	}
 	fmt.Fprintf(w, rowFmt, totalFields...)

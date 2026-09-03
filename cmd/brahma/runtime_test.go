@@ -18,7 +18,8 @@ func TestWriteRuntimeFile_UsesConfigEnv(t *testing.T) {
 	t.Setenv("CLAUDE_HOME", "")
 
 	cfg := &pipelinespec.Config{
-		StateDir: t.TempDir(),
+		StateDir:   t.TempDir(),
+		MaxWorkers: 6,
 		Env: map[string]string{
 			"WORKTREES_ROOT": "/from/config",
 			"CLAUDE_HOME":    "/from/config/claude",
@@ -46,5 +47,8 @@ func TestWriteRuntimeFile_UsesConfigEnv(t *testing.T) {
 	}
 	if rt.ClaudeHome != "/from/config/claude" {
 		t.Errorf("claude_home = %q, want %q", rt.ClaudeHome, "/from/config/claude")
+	}
+	if rt.MaxWorkers != 6 {
+		t.Errorf("max_workers = %d, want 6", rt.MaxWorkers)
 	}
 }

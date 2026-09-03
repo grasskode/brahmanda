@@ -1,10 +1,11 @@
 # brahmanda
 
 A small, config-driven pipeline orchestrator. One YAML file describes a set of
-pipelines; each pipeline keeps a fixed-size pool of workers full by spawning a
-short-lived runner subprocess on every tick. The orchestrator never runs worker
-code itself — it spawns runners, tracks counts, and records every outcome to a
-journal that the monitor reads.
+pipelines that share a single global worker pool; the orchestrator hands out the
+pool's slots round-robin across pipelines, spawning a short-lived runner
+subprocess per slot. The orchestrator never runs worker code itself — it spawns
+runners, tracks counts, and records every outcome to a journal that the monitor
+reads.
 
 *brahmanda* (the cosmic egg that contains the universe) is the suite; it ships
 three binaries, each named after the Hindu deity whose role it plays:
@@ -25,10 +26,13 @@ A handful of terms recur throughout; they mean:
 
 - **pipeline** — a named stage declared in `config.yaml`, with its own command,
   pool size, tick interval, and timeout.
-- **pool** — the set of workers a pipeline keeps running at once, bounded by
-  `pool_size`.
-- **tick** — one timer fire (`tick_interval`) at which the orchestrator tops the
-  pool back up to `pool_size` if it has room ("lazy fill").
+- **global pool** — the shared budget of concurrent workers across *all*
+  pipelines, capped by the top-level `max_workers`. The orchestrator fills it
+  round-robin, so no single pipeline monopolises it.
+- **pool_size** — a pipeline's own ceiling: the most workers it may hold at once
+  within the global pool, even when the pool has free slots.
+- **tick** — the `tick_interval` gate: a pipeline becomes eligible for another
+  global slot only once its tick has elapsed since its last spawn ("lazy fill").
 - **worker** — one execution of a pipeline's command, run by a runner.
 - **task** — a unit of work a worker claims, identified by `task_id`; the monitor
   folds all events sharing a `task_id` into one row.
@@ -39,7 +43,7 @@ A handful of terms recur throughout; they mean:
                 config.yaml
                      │
                      ▼
-              ┌──────────────┐         one per pool slot, per tick
+              ┌──────────────┐         one per free global-pool slot
               │    brahma     │ ── spawns ──▶  srishti (runner) ──▶ sh -c "<command>"   (your worker)
               │ (orchestrator)│                  │
               └──────────────┘                  │ parses worker stdout (NDJSON)
@@ -49,12 +53,15 @@ A handful of terms recur throughout; they mean:
                                            └──────────┘
 ```
 
-- **brahma**: The orchestrator loads a `config.yaml`. For each pipeline it fires
-  once immediately, then once per `tick_interval`. Each fire spawns one `srishti`
-  **if** the number of running workers is below `pool_size` (otherwise the tick
-  is a no-op — this is "lazy fill"). On `SIGINT`/`SIGTERM` it stops spawning and
-  drains in-flight runners before exiting. A single-instance `flock` on
-  `<state_dir>/brahma.lock` keeps two daemons from racing.
+- **brahma**: The orchestrator loads a `config.yaml` and runs one scheduler over
+  a global pool of `max_workers` slots. Whenever a slot is free it picks the next
+  eligible pipeline in round-robin order and spawns one `srishti` for it; a
+  pipeline is eligible when it holds fewer than `pool_size` workers **and** its
+  `tick_interval` has elapsed since it last spawned. Each pass fills every free
+  slot it can, so the pool ramps to capacity while staying fair across pipelines.
+  On `SIGINT`/`SIGTERM` it stops spawning and drains in-flight runners before
+  exiting. A single-instance `flock` on `<state_dir>/brahma.lock` keeps two
+  daemons from racing.
 
 - **srishti**: The runner runs your worker command under `sh -c`, so any shell
   construct (pipes, `&&`, env interpolation) works. It enforces `step_timeout`
@@ -84,8 +91,17 @@ the orchestrator over **stdout**, one JSON object per line (NDJSON):
 | `phase`   | no       | the pipeline name  | which step this event belongs to                             |
 | `outcome` | no       | `started`          | one of `started`, `succeeded`, `failed`, `timed_out`, `dead` |
 | `note`    | no       | —                  | free-text detail (failure reason, "PR opened", …)            |
+| `agent`   | no       | —                  | `{"runtime","session_id","cost_usd","usage"}` — the agent session this worker drove; see below |
 
 - **stderr** is captured to the worker's log file but never parsed as events.
+- A worker that drives an agent (e.g. a headless Claude Code session) tags
+  events with `agent`. Emit `{"runtime":"claude","session_id":"…"}` before the
+  run so a killed worker still leaves a breadcrumb, then once the run returns
+  emit it again with `cost_usd` and `usage` (`input_tokens`, `output_tokens`,
+  `cache_creation_input_tokens`, `cache_read_input_tokens`) copied from the
+  runtime's own accounting — claude's `total_cost_usd` and `usage`. Each run is
+  reported separately (a resumed session reports again). This is what feeds the
+  rolling budgets and chitra's cost column; brahma ships no pricing table.
 - A worker that exits **0 without ever claiming a task** (no event emitted) is
   treated as a legitimate idle no-op and journals nothing — ideal for "poll for
   work, find none, exit" loops.
@@ -194,13 +210,39 @@ throwaway `~/.local/state/brahmanda-demo` state dir:
 state_dir: ~/.local/state/brahmanda   # journal + worker state live here
 log_file: ""                       # brahma's own log; empty = stderr
 env_file: ./worker.env             # optional; env exported to every worker
+max_workers: 4                     # global cap on concurrent workers across ALL pipelines (required)
+budget: 40USD/d                    # optional rolling spend cap across ALL pipelines
 pipelines:
   - name: build                    # kebab-case, unique
-    pool_size: 1                   # max concurrent workers (default 1)
-    tick_interval: 8s              # delay between pool-fill checks (default 5m)
+    pool_size: 1                   # this pipeline's ceiling within the global pool (default 1)
+    tick_interval: 8s              # min delay before it's eligible for another slot (default 5m)
     step_timeout: 1m               # per-worker kill deadline (default 1h)
+    budget: 4USD/h                 # optional rolling spend cap for this pipeline
     command: ./examples/pipeline/stage.sh
 ```
+
+`max_workers` is the global pool: `brahma` never runs more than this many
+workers at once, no matter how many pipelines are configured or what their
+`pool_size` values sum to. Slots are handed out round-robin, so a busy pipeline
+can't starve the others. Each pipeline is still capped by its own `pool_size`.
+
+### Rolling budgets
+
+`budget` caps spend over a trailing window, written `<amount>USD/h` or
+`<amount>USD/d`. brahma sums the `cost_usd` workers reported on their journal
+events inside the window; when a pipeline's sum reaches its own `budget` — or
+every pipeline's sum reaches the top-level one — that pipeline is simply not
+launched again. Nothing errors and nothing in flight is interrupted: the
+scheduler logs one `budget exceeded — holding launches` warning naming the
+reset instant (when enough spend has aged out of the window), sleeps until
+then, and logs `budget restored` when launches resume. chitra shows the same
+position in a `BUDGET` column and a note line while a cap is holding.
+
+The check happens at launch, so a budget can overshoot by at most the workers
+already running. Spend that was never reported — a worker killed on
+`step_timeout` before it could journal its run — is invisible to the ledger.
+The ledger is seeded from the journal on startup, so restarting brahma never
+forgets spend that should still count.
 
 ### Worker environment
 
@@ -258,7 +300,8 @@ internal/agentui/       monitor snapshot collection + rendering (text + TUI)
 internal/journal/       per-worker NDJSON event log
 internal/lock/          single-instance flock
 internal/state/         state dir helpers
-internal/tokens/        Claude token accounting (optional, via ccusage)
+internal/tokens/        agent cost + token attribution from journal-reported usage
+internal/budget/        rolling spend-cap evaluation shared by brahma and chitra
 ```
 
 ## Orchestrating Claude Code agents
@@ -266,11 +309,13 @@ internal/tokens/        Claude token accounting (optional, via ccusage)
 brahma is worker-agnostic, but it grew up driving fleets of headless
 [Claude Code](https://claude.com/claude-code) agents, and a few features cater to
 that: the `AGENT_AUTONOMOUS` signal, the optional `agent-errors/claude` backoff
-marker, and chitra's **token burn** panel, which attributes Claude API
-input/output/cache tokens (and, when [`ccusage`](https://github.com/ryoppippi/ccusage)
-is on `$PATH`, dollar cost) per pipeline. Point chitra at the agents' worktrees
-with `--worktrees-root` (or `$WORKTREES_ROOT`) to enable it. None of this is
-required for ordinary shell workers.
+marker, rolling `budget` caps, and chitra's **token burn** panel, which
+attributes dollar cost and input/output/cache tokens per pipeline and task.
+Cost and tokens come from the `agent` field workers put on their journal
+events (claude's `-p --output-format json` envelope carries `total_cost_usd`
+and `usage`); sessions that never reported fall back to the Claude CLI's
+session log under `~/.claude` for tokens only and show `—` for cost. None of
+this is required for ordinary shell workers.
 
 The backoff marker is a convention, not orchestrator machinery: a worker that
 hits a Claude rate/quota limit writes `<state_dir>/agent-errors/claude`, and

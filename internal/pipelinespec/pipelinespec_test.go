@@ -21,6 +21,7 @@ func TestLoadFile_Success(t *testing.T) {
 	path := writeConfig(t, t.TempDir(), "config.yaml", `
 state_dir: /tmp/test-state
 log_file: /tmp/test-log
+max_workers: 5
 pipelines:
   - name: triage
     pool_size: 4
@@ -47,6 +48,9 @@ pipelines:
 	if cfg.SourcePath != path {
 		t.Errorf("SourcePath = %q, want %q", cfg.SourcePath, path)
 	}
+	if cfg.MaxWorkers != 5 {
+		t.Errorf("MaxWorkers = %d, want 5", cfg.MaxWorkers)
+	}
 	if len(cfg.Pipelines) != 2 {
 		t.Fatalf("got %d pipelines, want 2", len(cfg.Pipelines))
 	}
@@ -65,6 +69,7 @@ pipelines:
 
 func TestLoadFile_Defaults(t *testing.T) {
 	path := writeConfig(t, t.TempDir(), "config.yaml", `
+max_workers: 1
 pipelines:
   - name: minimal
     command: ./workers/minimal
@@ -98,6 +103,7 @@ func TestLoadFile_StateDirTildeExpansion(t *testing.T) {
 	}
 	path := writeConfig(t, t.TempDir(), "config.yaml", `
 state_dir: ~/orch-state
+max_workers: 1
 pipelines:
   - name: p
     command: ./w
@@ -136,6 +142,18 @@ state_dir: /tmp/x
 	}
 }
 
+func TestLoadFile_MaxWorkersRequired(t *testing.T) {
+	path := writeConfig(t, t.TempDir(), "config.yaml", `
+pipelines:
+  - name: solo
+    command: ./w
+`)
+	_, err := LoadFile(path)
+	if err == nil || !strings.Contains(err.Error(), "max_workers is required") {
+		t.Fatalf("expected max_workers-required error, got %v", err)
+	}
+}
+
 func TestLoadFile_MissingFile(t *testing.T) {
 	_, err := LoadFile(filepath.Join(t.TempDir(), "nope.yaml"))
 	if err == nil {
@@ -169,7 +187,7 @@ func TestLoadFile_PipelineValidation(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.label, func(t *testing.T) {
-			path := writeConfig(t, t.TempDir(), "config.yaml", c.yaml+"\n")
+			path := writeConfig(t, t.TempDir(), "config.yaml", "max_workers: 4\n"+c.yaml+"\n")
 			_, err := LoadFile(path)
 			if c.wantError == "" {
 				if err != nil {
@@ -210,6 +228,7 @@ QUOTED='spaced value'
 	path := writeConfig(t, dir, "config.yaml", `
 state_dir: /tmp/test-state
 env_file: worker.env
+max_workers: 2
 pipelines:
   - name: build
     command: ./build
@@ -282,4 +301,80 @@ func names(cfg *Config) []string {
 		out[i] = p.Name
 	}
 	return out
+}
+
+func TestParseBudget(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    Budget
+		wantErr bool
+	}{
+		{"", Budget{}, false},
+		{"4USD/h", Budget{Amount: 4, Window: time.Hour}, false},
+		{"2.5 usd/d", Budget{Amount: 2.5, Window: 24 * time.Hour}, false},
+		{"30USD/D", Budget{Amount: 30, Window: 24 * time.Hour}, false},
+		{"0USD/h", Budget{}, true},
+		{"4USD/m", Budget{}, true},
+		{"4/h", Budget{}, true},
+		{"four USD/h", Budget{}, true},
+	}
+	for _, c := range cases {
+		got, err := ParseBudget(c.in)
+		if c.wantErr {
+			if err == nil {
+				t.Errorf("ParseBudget(%q): want error, got %+v", c.in, got)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("ParseBudget(%q): %v", c.in, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("ParseBudget(%q) = %+v, want %+v", c.in, got, c.want)
+		}
+	}
+	if s := (Budget{Amount: 4, Window: time.Hour}).String(); s != "4USD/h" {
+		t.Errorf("String() = %q, want 4USD/h", s)
+	}
+	if s := (Budget{Amount: 2.5, Window: 24 * time.Hour}).String(); s != "2.5USD/d" {
+		t.Errorf("String() = %q, want 2.5USD/d", s)
+	}
+}
+
+func TestLoadFile_Budget(t *testing.T) {
+	path := writeConfig(t, t.TempDir(), "config.yaml", `
+max_workers: 2
+budget: 40USD/d
+pipelines:
+  - name: capped
+    budget: 4USD/h
+    command: ./worker
+  - name: free
+    command: ./worker
+`)
+	cfg, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	if want := (Budget{Amount: 40, Window: 24 * time.Hour}); cfg.Budget != want {
+		t.Errorf("global budget = %+v, want %+v", cfg.Budget, want)
+	}
+	if want := (Budget{Amount: 4, Window: time.Hour}); cfg.Pipelines[0].Budget != want {
+		t.Errorf("capped budget = %+v, want %+v", cfg.Pipelines[0].Budget, want)
+	}
+	if !cfg.Pipelines[1].Budget.IsZero() {
+		t.Errorf("free pipeline should have no budget, got %+v", cfg.Pipelines[1].Budget)
+	}
+
+	bad := writeConfig(t, t.TempDir(), "bad.yaml", `
+max_workers: 1
+pipelines:
+  - name: capped
+    budget: 4USD/week
+    command: ./worker
+`)
+	if _, err := LoadFile(bad); err == nil || !strings.Contains(err.Error(), "budget") {
+		t.Fatalf("want budget parse error, got %v", err)
+	}
 }

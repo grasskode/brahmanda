@@ -57,7 +57,54 @@ type Event struct {
 	Phase     string    `json:"phase"`
 	Outcome   Outcome   `json:"outcome"`
 	Note      string    `json:"note,omitempty"`
+	// Agent identifies the agent session this event's worker drove, when
+	// known. Optional: most events don't carry one. The token monitor
+	// joins its session id to the agent's usage log for per-phase burn.
+	Agent *AgentSession `json:"agent,omitempty"`
 }
+
+// AgentSession identifies one run of an agent runtime. Runtime names
+// the agent (e.g. "claude"); SessionID is that runtime's own session
+// identifier, which locates the run's usage log.
+//
+// CostUSD and Usage are what the run cost, as reported by the runtime's
+// own accounting (claude's result envelope). A worker emits them on an
+// event once the run has returned; the pre-run breadcrumb carries
+// neither. Both are per invocation — a session resumed several times
+// reports each run separately and readers sum them.
+type AgentSession struct {
+	Runtime   string  `json:"runtime"`
+	SessionID string  `json:"session_id"`
+	CostUSD   float64 `json:"cost_usd,omitempty"`
+	Usage     *Usage  `json:"usage,omitempty"`
+}
+
+// Usage is one run's token counts. Field names follow the claude API's
+// usage object so a worker can pass the envelope's usage through
+// unchanged. Cache reads are kept separate from input — they are an
+// order of magnitude cheaper and would misrepresent burn if merged.
+type Usage struct {
+	InputTokens         int64 `json:"input_tokens"`
+	OutputTokens        int64 `json:"output_tokens"`
+	CacheCreationTokens int64 `json:"cache_creation_input_tokens"`
+	CacheReadTokens     int64 `json:"cache_read_input_tokens"`
+}
+
+// Add accumulates other into u.
+func (u *Usage) Add(other Usage) {
+	u.InputTokens += other.InputTokens
+	u.OutputTokens += other.OutputTokens
+	u.CacheCreationTokens += other.CacheCreationTokens
+	u.CacheReadTokens += other.CacheReadTokens
+}
+
+// Total is the sum of every token class.
+func (u Usage) Total() int64 {
+	return u.InputTokens + u.OutputTokens + u.CacheCreationTokens + u.CacheReadTokens
+}
+
+// IsZero reports whether no tokens were recorded.
+func (u Usage) IsZero() bool { return u.Total() == 0 }
 
 // safeNameRE bounds Pool and WorkerID to a kebab-case-ish charset so
 // they're safe to embed in a filesystem path. Same shape as the
@@ -147,6 +194,13 @@ func Read(stateRoot string, since time.Time) ([]Event, error) {
 	}
 	sort.Slice(events, func(i, j int) bool { return events[i].Timestamp.Before(events[j].Timestamp) })
 	return events, nil
+}
+
+// ReadFrom decodes the events in one journal file (or any NDJSON
+// stream), keeping those at or after since; a zero since keeps all. Bad
+// lines are skipped silently.
+func ReadFrom(r io.Reader, since time.Time) []Event {
+	return readFiltered(r, since)
 }
 
 // readFiltered streams r line-by-line, decoding each as Event, keeping

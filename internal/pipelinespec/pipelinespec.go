@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -45,6 +46,19 @@ type Config struct {
 	// reserved for the runner and rejected.
 	EnvFile string `yaml:"env_file"`
 
+	// MaxWorkers caps the total number of worker invocations running
+	// concurrently across all pipelines. Required (>= 1). The orchestrator
+	// fills this global pool round-robin across pipelines; a pipeline never
+	// exceeds its own pool_size, but the sum of every pipeline's running
+	// workers never exceeds MaxWorkers.
+	MaxWorkers int `yaml:"max_workers"`
+
+	// Budget is an optional rolling spend cap across ALL pipelines, e.g.
+	// "40USD/d". When the cost workers reported inside the trailing window
+	// reaches it, no pipeline is launched until enough spend ages out.
+	// Per-pipeline Spec.Budget applies on top of it.
+	Budget Budget `yaml:"budget"`
+
 	// Pipelines is the list of pipelines the orchestrator runs. Required;
 	// at least one entry. Names must be unique.
 	Pipelines []Spec `yaml:"pipelines"`
@@ -66,7 +80,10 @@ type Spec struct {
 	// digits, hyphens; starts with a letter) and unique across the file.
 	Name string `yaml:"name"`
 
-	// PoolSize caps concurrent worker invocations for this pipeline.
+	// PoolSize caps concurrent worker invocations for this pipeline. It is
+	// a per-pipeline ceiling within the shared global pool (Config.MaxWorkers):
+	// the pipeline never runs more than PoolSize workers at once, even when
+	// the global pool has free slots.
 	PoolSize int `yaml:"pool_size"`
 
 	// TickInterval is the minimum delay between pool-fill checks. On
@@ -77,6 +94,14 @@ type Spec struct {
 	// StepTimeout bounds one worker invocation; exceeding it triggers
 	// SIGTERM-then-SIGKILL.
 	StepTimeout time.Duration `yaml:"step_timeout"`
+
+	// Budget is an optional rolling spend cap for this pipeline, written
+	// as "<amount>USD/<h|d>" (e.g. "4USD/h"). The orchestrator sums the
+	// cost workers reported on their journal events over the trailing
+	// window and stops launching the pipeline while the sum is at or
+	// above the amount. In-flight workers are never interrupted. Zero
+	// means unlimited.
+	Budget Budget `yaml:"budget"`
 
 	// Command is the shell snippet that runs the worker. The runner
 	// passes it to `sh -c`, so any shell construct (env interpolation,
@@ -95,6 +120,74 @@ const (
 )
 
 var nameRE = regexp.MustCompile(`^[a-z][a-z0-9-]*$`)
+
+// Budget is a rolling spend cap: at most Amount USD over any trailing
+// Window. The zero value means no cap.
+type Budget struct {
+	Amount float64
+	Window time.Duration
+}
+
+// budgetRE matches "<amount>USD/<unit>" with an optional space before
+// USD and a case-insensitive currency; unit is h (hour) or d (day).
+var budgetRE = regexp.MustCompile(`(?i)^\s*([0-9]+(?:\.[0-9]+)?)\s*USD\s*/\s*([hd])\s*$`)
+
+// ParseBudget parses "<amount>USD/<h|d>", e.g. "4USD/h" or "30 USD/d".
+// An empty string is the zero Budget (no cap).
+func ParseBudget(s string) (Budget, error) {
+	if strings.TrimSpace(s) == "" {
+		return Budget{}, nil
+	}
+	m := budgetRE.FindStringSubmatch(s)
+	if m == nil {
+		return Budget{}, fmt.Errorf("budget %q must look like \"<amount>USD/h\" or \"<amount>USD/d\"", s)
+	}
+	amount, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return Budget{}, fmt.Errorf("budget %q: bad amount: %w", s, err)
+	}
+	if amount <= 0 {
+		return Budget{}, fmt.Errorf("budget %q: amount must be > 0", s)
+	}
+	window := time.Hour
+	if strings.EqualFold(m[2], "d") {
+		window = 24 * time.Hour
+	}
+	return Budget{Amount: amount, Window: window}, nil
+}
+
+// IsZero reports whether no cap is configured.
+func (b Budget) IsZero() bool { return b.Amount <= 0 || b.Window <= 0 }
+
+// String renders the canonical "<amount>USD/<h|d>" form; empty when zero.
+func (b Budget) String() string {
+	if b.IsZero() {
+		return ""
+	}
+	unit := "h"
+	if b.Window == 24*time.Hour {
+		unit = "d"
+	}
+	return strconv.FormatFloat(b.Amount, 'f', -1, 64) + "USD/" + unit
+}
+
+// UnmarshalYAML accepts the "<amount>USD/<h|d>" scalar form.
+func (b *Budget) UnmarshalYAML(value *yaml.Node) error {
+	var raw string
+	if err := value.Decode(&raw); err != nil {
+		return fmt.Errorf("budget: expected a string like \"4USD/h\": %w", err)
+	}
+	parsed, err := ParseBudget(raw)
+	if err != nil {
+		return err
+	}
+	*b = parsed
+	return nil
+}
+
+// MarshalYAML emits the canonical scalar form (or an empty string when
+// zero) so a re-serialised config round-trips.
+func (b Budget) MarshalYAML() (any, error) { return b.String(), nil }
 
 // LoadFile reads, parses, defaults, and validates the YAML config at
 // path. Returns the populated Config or the first error encountered.
@@ -155,6 +248,9 @@ func (c *Config) validate() error {
 			return fmt.Errorf("pipelines[%d]: name %q declared twice", i, c.Pipelines[i].Name)
 		}
 		seen[c.Pipelines[i].Name] = true
+	}
+	if c.MaxWorkers < 1 {
+		return fmt.Errorf("max_workers is required and must be >= 1, got %d", c.MaxWorkers)
 	}
 	return nil
 }

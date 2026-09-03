@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/grasskode/brahmanda/internal/journal"
+	"github.com/grasskode/brahmanda/internal/pipelinespec"
 	"github.com/grasskode/brahmanda/internal/tokens"
 )
 
@@ -180,9 +181,9 @@ func TestRenderPipelinesWithTokens_InlineColumnsAndTotal(t *testing.T) {
 		PipelineTicks:      map[string]time.Duration{"investigate": 5 * time.Minute, "implement": 5 * time.Minute, "prune": 15 * time.Minute},
 		PipelineCapacities: map[string]int{"investigate": 2, "implement": 2, "prune": 1},
 		Tokens: TokensPanel{
-			Available:      true,
-			CcusageEnabled: true,
-			Note:           "last 6h",
+			Available:     true,
+			CostAvailable: true,
+			Note:          "last 6h",
 			ByPhase: []tokens.Rollup{
 				{Key: "investigate", Sessions: 3, Usage: tokens.Usage{InputTokens: 1200, OutputTokens: 300, CacheReadTokens: 5000}, Cost: 0.42},
 				{Key: "implement", Sessions: 5, Usage: tokens.Usage{InputTokens: 8000, OutputTokens: 2000, CacheReadTokens: 50000}, Cost: 3.10},
@@ -418,5 +419,45 @@ func TestLastPhaseNote_SurfacesSucceededNoteWithoutErrorFlag(t *testing.T) {
 	}
 	if isErr {
 		t.Errorf("succeeded phase must not be flagged as error")
+	}
+}
+
+// A pipeline with a budget gets a BUDGET column showing spent/cap, and a
+// held budget adds a note line naming the reset instant.
+func TestRenderPipelines_BudgetColumnAndNote(t *testing.T) {
+	now := time.Now()
+	s := Snapshot{
+		Since:      time.Hour,
+		SinceLabel: "last 1h",
+		Pipelines: []PipelineStat{
+			{Name: "gh-code-review", Ran: 4},
+			{Name: "prune", Ran: 1},
+		},
+		PipelineOrder: []string{"gh-code-review", "prune"},
+		PipelineBudgets: map[string]BudgetStat{
+			"gh-code-review": {
+				Limit:    pipelinespec.Budget{Amount: 4, Window: time.Hour},
+				Spent:    4.31,
+				Exceeded: true,
+				ResetAt:  now.Add(12 * time.Minute),
+			},
+		},
+	}
+	var b strings.Builder
+	RenderPipelines(&b, s)
+	out := b.String()
+	if !strings.Contains(out, "BUDGET") {
+		t.Errorf("missing BUDGET header:\n%s", out)
+	}
+	if !strings.Contains(out, "$4.31/4USD/h") {
+		t.Errorf("missing spent/cap cell:\n%s", out)
+	}
+	if !strings.Contains(out, "budget: gh-code-review exceeded 4USD/h ($4.31 spent)") || !strings.Contains(out, "resets in 12m") {
+		t.Errorf("missing held-budget note with reset:\n%s", out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "  prune") && !strings.Contains(line, "-") {
+			t.Errorf("unbudgeted pipeline should show '-' in BUDGET: %q", line)
+		}
 	}
 }

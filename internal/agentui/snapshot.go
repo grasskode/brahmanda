@@ -29,8 +29,10 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/grasskode/brahmanda/internal/budget"
 	"github.com/grasskode/brahmanda/internal/journal"
 	"github.com/grasskode/brahmanda/internal/lock"
+	"github.com/grasskode/brahmanda/internal/pipelinespec"
 	"github.com/grasskode/brahmanda/internal/state"
 	"github.com/grasskode/brahmanda/internal/tokens"
 )
@@ -53,11 +55,20 @@ type Snapshot struct {
 	// Per-pipeline configured pool size (max concurrent worker
 	// invocations). Empty when the orchestrator is not running.
 	PipelineCapacities map[string]int
+	// PipelineBudgets holds the rolling-budget position of every pipeline
+	// that declares a budget (from runtime.yaml + journal cost events).
+	// GlobalBudget is the cross-pipeline cap, nil when none is configured.
+	PipelineBudgets map[string]BudgetStat
+	GlobalBudget    *BudgetStat
 	// PipelineOrder is pipeline names in the order they appear in the
 	// orchestrator's config (preserved through runtime.yaml). Used to
 	// render the pipelines table in operator-meaningful order rather
 	// than alphabetically. Empty when the orchestrator isn't running.
 	PipelineOrder []string
+	// MaxWorkers is the global concurrent-worker cap shared across all
+	// pipelines (from runtime.yaml). Zero when the orchestrator is not
+	// running or predates the global-pool field.
+	MaxWorkers int
 
 	// Panels.
 	Orchestrator   OrchestratorPanel
@@ -122,11 +133,22 @@ type PhaseStep struct {
 }
 
 type TokensPanel struct {
-	Available      bool // false when ccusage was missing OR collection erred
-	CcusageEnabled bool // true when ccusage produced cost data
-	ByPhase        []tokens.Rollup
-	ByTask         []tokens.Rollup
-	Note           string // error / "by phase, last 24h" etc.
+	Available     bool // false when there was no state dir OR collection erred
+	CostAvailable bool // true when at least one session reported its cost
+	ByPhase       []tokens.Rollup
+	ByTask        []tokens.Rollup
+	Note          string // error / "by phase, last 24h" etc.
+}
+
+// BudgetStat is one pipeline's rolling-budget position: what the config
+// caps it at and what its workers reported spending inside the trailing
+// window. Exceeded means the orchestrator is currently holding launches;
+// ResetAt is when enough spend has aged out for it to resume.
+type BudgetStat struct {
+	Limit    pipelinespec.Budget
+	Spent    float64
+	Exceeded bool
+	ResetAt  time.Time
 }
 
 // CollectOptions controls a snapshot. Most fields can be left empty
@@ -241,13 +263,21 @@ func Collect(ctx context.Context, opts CollectOptions) Snapshot {
 		SinceLabel:         opts.SinceLabel,
 		PipelineTicks:      map[string]time.Duration{},
 		PipelineCapacities: map[string]int{},
+		PipelineBudgets:    map[string]BudgetStat{},
 	}
+	budgets := map[string]pipelinespec.Budget{}
+	var globalBudget pipelinespec.Budget
 	if rt != nil {
 		s.ConfigPath = rt.ConfigPath
+		s.MaxWorkers = rt.MaxWorkers
+		globalBudget, _ = pipelinespec.ParseBudget(rt.Budget)
 		for _, p := range rt.Pipelines {
 			s.PipelineTicks[p.Name] = p.TickInterval
 			s.PipelineCapacities[p.Name] = p.PoolSize
 			s.PipelineOrder = append(s.PipelineOrder, p.Name)
+			if b, err := pipelinespec.ParseBudget(p.Budget); err == nil && !b.IsZero() {
+				budgets[p.Name] = b
+			}
 		}
 	}
 
@@ -260,6 +290,7 @@ func Collect(ctx context.Context, opts CollectOptions) Snapshot {
 	s.collectTasks(events)
 	s.collectSilentFailures(events)
 	s.collectTokens(ctx, opts, cutoff)
+	s.collectBudgets(opts.StateDir, captured, globalBudget, budgets)
 
 	return s
 }
@@ -270,10 +301,13 @@ type runtimeFile struct {
 	ConfigPath    string `yaml:"config_path"`
 	WorktreesRoot string `yaml:"worktrees_root"`
 	ClaudeHome    string `yaml:"claude_home"`
+	MaxWorkers    int    `yaml:"max_workers"`
+	Budget        string `yaml:"budget"`
 	Pipelines     []struct {
 		Name         string        `yaml:"name"`
 		PoolSize     int           `yaml:"pool_size"`
 		TickInterval time.Duration `yaml:"tick_interval"`
+		Budget       string        `yaml:"budget"`
 	} `yaml:"pipelines"`
 }
 
@@ -560,28 +594,62 @@ func (s *Snapshot) collectTasks(events []journal.Event) {
 	sort.Slice(s.Tasks, func(i, j int) bool { return s.Tasks[i].TaskID < s.Tasks[j].TaskID })
 }
 
-// collectTokens consults ccusage via internal/tokens. Failures (missing
-// ccusage, no worktrees root) leave Tokens.Available=false; the panel
-// renders a single explanatory line.
+// collectTokens rolls up the cost and usage workers reported in the
+// journal via internal/tokens. ClaudeHome is optional — it only enables
+// the tokens-only jsonl fallback for sessions that never reported.
+// Failures leave Tokens.Available=false; the panel renders a single
+// explanatory line.
 func (s *Snapshot) collectTokens(ctx context.Context, opts CollectOptions, cutoff time.Time) {
-	if opts.WorktreesRoot == "" || opts.ClaudeHome == "" {
-		s.Tokens.Note = "skipped — set --worktrees-root and ensure ~/.claude exists"
+	if opts.StateDir == "" {
+		s.Tokens.Note = "skipped — need a state dir"
 		return
 	}
 	subCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	res, err := tokens.Collect(subCtx, tokens.Options{
-		WorktreesRoot: opts.WorktreesRoot,
-		ClaudeHome:    opts.ClaudeHome,
-		Since:         cutoff,
+		StateRoot:  opts.StateDir,
+		ClaudeHome: opts.ClaudeHome,
+		Since:      cutoff,
 	})
 	if err != nil {
 		s.Tokens.Note = "collect failed: " + err.Error()
 		return
 	}
 	s.Tokens.Available = true
-	s.Tokens.CcusageEnabled = res.CcusageEnabled
+	s.Tokens.CostAvailable = res.CostAvailable
 	s.Tokens.ByPhase = res.ByPhase
 	s.Tokens.ByTask = res.ByTask
 	s.Tokens.Note = fmt.Sprintf("last %s", opts.Since)
+}
+
+// collectBudgets evaluates every configured rolling budget at now. It
+// re-reads the journal over the longest budget window, which may reach
+// further back than the panel's lookback cutoff.
+func (s *Snapshot) collectBudgets(stateDir string, now time.Time, global pipelinespec.Budget, perPipeline map[string]pipelinespec.Budget) {
+	if stateDir == "" || (global.IsZero() && len(perPipeline) == 0) {
+		return
+	}
+	window := global.Window
+	for _, b := range perPipeline {
+		if b.Window > window {
+			window = b.Window
+		}
+	}
+	events, err := journal.Read(stateDir, now.Add(-window))
+	if err != nil {
+		return
+	}
+	toStat := func(b pipelinespec.Budget, pool string) BudgetStat {
+		var l budget.Ledger
+		l.AddEvents(events, pool)
+		st := l.Status(b, now)
+		return BudgetStat{Limit: b, Spent: st.Spent, Exceeded: st.Exceeded, ResetAt: st.ResetAt}
+	}
+	if !global.IsZero() {
+		g := toStat(global, "")
+		s.GlobalBudget = &g
+	}
+	for name, b := range perPipeline {
+		s.PipelineBudgets[name] = toStat(b, name)
+	}
 }

@@ -342,10 +342,11 @@ func (p *stdoutParser) run(r io.Reader) {
 // workerEvent is the shape the worker emits per stdout line. Only
 // task_id is required; the runner fills in defaults for the rest.
 type workerEvent struct {
-	TaskID  string `json:"task_id"`
-	Phase   string `json:"phase,omitempty"`
-	Outcome string `json:"outcome,omitempty"`
-	Note    string `json:"note,omitempty"`
+	TaskID  string                `json:"task_id"`
+	Phase   string                `json:"phase,omitempty"`
+	Outcome string                `json:"outcome,omitempty"`
+	Note    string                `json:"note,omitempty"`
+	Agent   *journal.AgentSession `json:"agent,omitempty"`
 }
 
 func parseEvent(line, pipeline, workerID string) (journal.Event, error) {
@@ -371,6 +372,7 @@ func parseEvent(line, pipeline, workerID string) (journal.Event, error) {
 		Phase:    phase,
 		Outcome:  outcome,
 		Note:     w.Note,
+		Agent:    w.Agent,
 	}, nil
 }
 

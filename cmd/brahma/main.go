@@ -32,13 +32,14 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 	"gopkg.in/yaml.v3"
 
+	"github.com/grasskode/brahmanda/internal/budget"
+	"github.com/grasskode/brahmanda/internal/journal"
 	"github.com/grasskode/brahmanda/internal/lock"
 	"github.com/grasskode/brahmanda/internal/pipelinespec"
 )
@@ -113,6 +114,7 @@ func run(configPath string) error {
 		"config", configPath,
 		"state_dir", cfg.StateDir,
 		"pipelines", len(cfg.Pipelines),
+		"max_workers", cfg.MaxWorkers,
 		"runner", runnerPath,
 		"env_file", cfg.EnvFile,
 		"worker_env_vars", len(workerEnv),
@@ -124,65 +126,361 @@ func run(configPath string) error {
 	// forever. Holding the lock guarantees we're the only orchestrator.
 	reapOrphans(log, cfg.StateDir)
 
-	var wg sync.WaitGroup
-	for i := range cfg.Pipelines {
-		spec := cfg.Pipelines[i]
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			runPipeline(ctx, log, logOut, cfg.StateDir, runnerPath, spec, workerEnv)
-		}()
-	}
-	wg.Wait()
+	sched := newScheduler(log, cfg.StateDir, runnerPath, cfg.MaxWorkers, cfg.Pipelines, workerEnv)
+	sched.globalBudget = cfg.Budget
+	sched.run(ctx)
 	log.Info("orchestrator stopped")
 	return nil
 }
 
-// runPipeline drives one pipeline's spawn loop. Fires once immediately
-// at startup, then once per tick_interval. Each fire spawns one runner
-// if running < pool_size; otherwise it's a no-op. On context cancel,
-// stops firing and waits for in-flight runners to drain.
-func runPipeline(ctx context.Context, log *slog.Logger, logOut io.Writer, stateDir, runnerPath string, spec pipelinespec.Spec, workerEnv []string) {
-	pLog := log.With("pipeline", spec.Name)
-	pLog.Info("pipeline ready",
-		"pool_size", spec.PoolSize,
-		"tick_interval", spec.TickInterval,
-		"step_timeout", spec.StepTimeout,
-	)
+// spawnFunc launches one worker and blocks until it exits. The
+// scheduler's default runs the srishti runner via spawnWorker; tests
+// substitute a stub to exercise admission without real subprocesses.
+type spawnFunc func(ctx context.Context, pLog *slog.Logger, spec pipelinespec.Spec, slot int, workerID string)
 
-	var running atomic.Int64
-	var workers sync.WaitGroup
+// scheduler owns global worker admission. A single loop hands out the
+// max_workers global slots to pipelines round-robin: a pipeline is
+// eligible for a slot when it is running fewer than its pool_size
+// workers, at least its tick_interval has elapsed since it last
+// spawned one, and neither its own rolling budget nor the global one is
+// exhausted. Each pass fills greedily — it keeps handing out free
+// slots in rotation until the global cap is reached or no pipeline is
+// eligible — so the pool ramps to capacity without any single pipeline
+// monopolising it.
+type scheduler struct {
+	log          *slog.Logger
+	stateDir     string
+	maxWorkers   int
+	specs        []pipelinespec.Spec
+	globalBudget pipelinespec.Budget
+	spawn        spawnFunc
 
-	fire := func() {
-		cur := running.Load()
-		if cur >= int64(spec.PoolSize) {
-			return
-		}
-		running.Add(1)
-		workers.Add(1)
-		slot := int(cur)
-		go func() {
-			defer workers.Done()
-			defer running.Add(-1)
-			spawnWorker(ctx, pLog, logOut, stateDir, runnerPath, spec, slot, workerEnv)
-		}()
+	mu            sync.Mutex
+	globalRunning int
+	running       []int       // per-spec concurrent worker count
+	slots         [][]bool    // per-spec slot occupancy; len == pool_size
+	nextEligible  []time.Time // per-spec earliest next spawn time
+	cursor        int         // round-robin start index for the next pass
+
+	// Spend ledgers feed the rolling budgets: one per spec plus one across
+	// all pipelines. A worker's reported cost is folded in when it exits.
+	// held/resetAt mirror the last evaluation so transitions are logged
+	// once and the loop can sleep until a budget frees up.
+	ledgers      []*budget.Ledger
+	globalLedger *budget.Ledger
+	held         []bool
+	resetAt      []time.Time
+	globalHeld   bool
+	globalReset  time.Time
+
+	wakeup chan struct{}  // buffered(1); a finishing worker pokes it
+	wg     sync.WaitGroup // tracks in-flight worker goroutines
+}
+
+func newScheduler(log *slog.Logger, stateDir, runnerPath string, maxWorkers int, specs []pipelinespec.Spec, workerEnv []string) *scheduler {
+	s := &scheduler{
+		log:          log,
+		stateDir:     stateDir,
+		maxWorkers:   maxWorkers,
+		specs:        specs,
+		running:      make([]int, len(specs)),
+		slots:        make([][]bool, len(specs)),
+		nextEligible: make([]time.Time, len(specs)),
+		ledgers:      make([]*budget.Ledger, len(specs)),
+		globalLedger: &budget.Ledger{},
+		held:         make([]bool, len(specs)),
+		resetAt:      make([]time.Time, len(specs)),
+		wakeup:       make(chan struct{}, 1),
 	}
+	for i := range specs {
+		s.slots[i] = make([]bool, specs[i].PoolSize)
+		s.ledgers[i] = &budget.Ledger{}
+	}
+	s.spawn = func(ctx context.Context, pLog *slog.Logger, spec pipelinespec.Spec, slot int, workerID string) {
+		spawnWorker(ctx, pLog, stateDir, runnerPath, spec, slot, workerID, workerEnv)
+	}
+	return s
+}
 
-	fire() // seed the pool so the first worker doesn't wait one full tick
+// run drives the scheduling loop until ctx is cancelled, then waits for
+// in-flight workers to drain before returning.
+func (s *scheduler) run(ctx context.Context) {
+	for i := range s.specs {
+		s.log.Info("pipeline ready",
+			"pipeline", s.specs[i].Name,
+			"pool_size", s.specs[i].PoolSize,
+			"tick_interval", s.specs[i].TickInterval,
+			"step_timeout", s.specs[i].StepTimeout,
+			"budget", s.specs[i].Budget.String(),
+		)
+	}
+	s.log.Info("global pool ready", "max_workers", s.maxWorkers, "budget", s.globalBudget.String())
+	s.seedLedgers(time.Now())
 
-	ticker := time.NewTicker(spec.TickInterval)
-	defer ticker.Stop()
+	timer := time.NewTimer(time.Hour)
+	if !timer.Stop() {
+		<-timer.C
+	}
 	for {
+		s.pass(ctx)
+
+		var timerC <-chan time.Time
+		if d, ok := s.nextWakeDelay(time.Now()); ok {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(d)
+			timerC = timer.C
+		}
+
 		select {
 		case <-ctx.Done():
-			pLog.Info("pipeline draining", "running", running.Load())
-			workers.Wait()
-			pLog.Info("pipeline drained")
+			s.log.Info("scheduler draining", "running", s.runningCount())
+			s.wg.Wait()
+			s.log.Info("scheduler drained")
 			return
-		case <-ticker.C:
-			fire()
+		case <-s.wakeup:
+		case <-timerC:
 		}
 	}
+}
+
+// pass hands out every free global slot it can, round-robin, to
+// eligible pipelines. It holds mu for the whole scan; spawnLocked only
+// starts a goroutine, so the critical section stays short.
+func (s *scheduler) pass(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for s.globalRunning < s.maxWorkers {
+		idx, ok := s.pickLocked(now)
+		if !ok {
+			return
+		}
+		s.spawnLocked(ctx, idx, now)
+	}
+}
+
+// pickLocked returns the next eligible pipeline in round-robin order
+// starting from the cursor, or ok=false when none is eligible. A
+// pipeline is eligible when it has a free pool slot and its tick_interval
+// has elapsed since it last spawned.
+func (s *scheduler) pickLocked(now time.Time) (int, bool) {
+	n := len(s.specs)
+	for i := 0; i < n; i++ {
+		idx := (s.cursor + i) % n
+		if s.running[idx] >= s.specs[idx].PoolSize {
+			continue
+		}
+		if now.Before(s.nextEligible[idx]) {
+			continue
+		}
+		if s.budgetHeldLocked(idx, now) {
+			continue
+		}
+		return idx, true
+	}
+	return 0, false
+}
+
+// budgetHeldLocked reports whether pipeline idx must not launch right
+// now because its own rolling budget or the global one is exhausted.
+// It logs each transition once — a warning naming the reset instant when
+// a cap starts holding launches, an info line when it lifts — so a held
+// pipeline is visible without spamming every pass. Caller must hold mu.
+func (s *scheduler) budgetHeldLocked(idx int, now time.Time) bool {
+	held := false
+	if !s.globalBudget.IsZero() {
+		st := s.globalLedger.Status(s.globalBudget, now)
+		s.logBudgetTransition("all pipelines", s.globalBudget, st, &s.globalHeld, &s.globalReset)
+		held = st.Exceeded
+	}
+	if b := s.specs[idx].Budget; !b.IsZero() {
+		st := s.ledgers[idx].Status(b, now)
+		s.logBudgetTransition(s.specs[idx].Name, b, st, &s.held[idx], &s.resetAt[idx])
+		held = held || st.Exceeded
+	}
+	return held
+}
+
+func (s *scheduler) logBudgetTransition(scope string, b pipelinespec.Budget, st budget.Status, held *bool, resetAt *time.Time) {
+	*resetAt = st.ResetAt
+	switch {
+	case st.Exceeded && !*held:
+		s.log.Warn("budget exceeded — holding launches",
+			"scope", scope,
+			"budget", b.String(),
+			"spent_usd", fmt.Sprintf("%.2f", st.Spent),
+			"resets_at", st.ResetAt.Local().Format(time.RFC3339),
+			"resets_in", time.Until(st.ResetAt).Round(time.Second),
+		)
+	case !st.Exceeded && *held:
+		s.log.Info("budget restored — launches resume",
+			"scope", scope,
+			"budget", b.String(),
+			"spent_usd", fmt.Sprintf("%.2f", st.Spent),
+		)
+	}
+	*held = st.Exceeded
+}
+
+// seedLedgers loads the cost workers reported inside the longest budget
+// window from the journal, so a restarted orchestrator does not forget
+// spend that should still count. No-op when no budget is configured.
+func (s *scheduler) seedLedgers(now time.Time) {
+	window := s.globalBudget.Window
+	for _, spec := range s.specs {
+		if spec.Budget.Window > window {
+			window = spec.Budget.Window
+		}
+	}
+	if window <= 0 {
+		return
+	}
+	events, err := journal.Read(s.stateDir, now.Add(-window))
+	if err != nil {
+		s.log.Warn("seed budget ledgers from journal failed (starting empty)", "err", err)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.globalLedger.AddEvents(events, "")
+	for i, spec := range s.specs {
+		s.ledgers[i].AddEvents(events, spec.Name)
+	}
+}
+
+// recordSpendLocked folds the cost a finished worker reported into its
+// pipeline's ledger and the global one, reading the worker's own journal
+// file. Ledgers are pruned to the longest window so they stay bounded.
+// Caller must hold mu.
+func (s *scheduler) recordSpendLocked(idx int, workerID string, now time.Time) {
+	if s.globalBudget.IsZero() && s.specs[idx].Budget.IsZero() {
+		return
+	}
+	f, err := os.Open(journal.FileFor(s.stateDir, s.specs[idx].Name, workerID))
+	if err != nil {
+		return // worker journaled nothing (idle no-op) — no spend to record
+	}
+	defer f.Close()
+	events := journal.ReadFrom(f, time.Time{})
+	s.globalLedger.AddEvents(events, "")
+	s.ledgers[idx].AddEvents(events, s.specs[idx].Name)
+
+	window := s.globalBudget.Window
+	for _, spec := range s.specs {
+		if spec.Budget.Window > window {
+			window = spec.Budget.Window
+		}
+	}
+	s.globalLedger.Prune(now.Add(-window))
+	s.ledgers[idx].Prune(now.Add(-window))
+}
+
+// spawnLocked reserves a slot for pipeline idx, advances the round-robin
+// cursor past it, and launches the worker goroutine. When the worker
+// exits it releases the slot and pokes the loop so the freed global slot
+// is refilled promptly. Caller must hold mu.
+func (s *scheduler) spawnLocked(ctx context.Context, idx int, now time.Time) {
+	spec := s.specs[idx]
+	slot := s.takeSlotLocked(idx)
+	s.running[idx]++
+	s.globalRunning++
+	s.nextEligible[idx] = now.Add(spec.TickInterval)
+	s.cursor = (idx + 1) % len(s.specs)
+
+	workerID := uuid.NewString()[:8]
+	pLog := s.log.With("pipeline", spec.Name)
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.spawn(ctx, pLog, spec, slot, workerID)
+		s.mu.Lock()
+		s.running[idx]--
+		s.globalRunning--
+		s.freeSlotLocked(idx, slot)
+		s.recordSpendLocked(idx, workerID, time.Now())
+		s.mu.Unlock()
+		select {
+		case s.wakeup <- struct{}{}:
+		default:
+		}
+	}()
+}
+
+// nextWakeDelay returns how long until the loop should wake to fill a
+// slot that isn't fillable right now: the soonest tick_interval boundary
+// of a pipeline that still has pool room. Returns ok=false when the
+// global pool is full (a finishing worker will poke the loop) or no
+// pipeline has room.
+func (s *scheduler) nextWakeDelay(now time.Time) (time.Duration, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.globalRunning >= s.maxWorkers {
+		return 0, false
+	}
+	var soonest time.Time
+	found := false
+	for idx := range s.specs {
+		if s.running[idx] >= s.specs[idx].PoolSize {
+			continue
+		}
+		t := s.nextEligible[idx]
+		// A held budget pushes the wake past its reset instant; the pass
+		// re-evaluates then, when enough spend has aged out.
+		if s.globalHeld && s.globalReset.After(t) {
+			t = s.globalReset
+		}
+		if s.held[idx] && s.resetAt[idx].After(t) {
+			t = s.resetAt[idx]
+		}
+		if !t.After(now) {
+			return 0, true // eligible now — wake immediately
+		}
+		if !found || t.Before(soonest) {
+			soonest = t
+			found = true
+		}
+	}
+	if !found {
+		return 0, false
+	}
+	d := time.Until(soonest)
+	if d < 0 {
+		d = 0
+	}
+	return d, true
+}
+
+// takeSlotLocked reserves and returns the lowest free pool slot for
+// pipeline idx (0..pool_size-1), exposed to the worker as
+// AGENT_WORKER_INDEX. Caller must hold mu and have checked pool room.
+func (s *scheduler) takeSlotLocked(idx int) int {
+	for i, used := range s.slots[idx] {
+		if !used {
+			s.slots[idx][i] = true
+			return i
+		}
+	}
+	return 0 // unreachable: caller checked running < pool_size
+}
+
+func (s *scheduler) freeSlotLocked(idx, slot int) {
+	if slot >= 0 && slot < len(s.slots[idx]) {
+		s.slots[idx][slot] = false
+	}
+}
+
+func (s *scheduler) runningCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.globalRunning
 }
 
 // spawnWorker execs the runner binary for one pool slot. Its stdout
@@ -192,8 +490,7 @@ func runPipeline(ctx context.Context, log *slog.Logger, logOut io.Writer, stateD
 // A sibling <worker_id>.pid file holds the runner PID for the
 // monitor's liveness check, removed on exit so a stale file can't
 // claim a now-recycled PID belongs to a worker.
-func spawnWorker(ctx context.Context, log *slog.Logger, logOut io.Writer, stateDir, runnerPath string, spec pipelinespec.Spec, slot int, workerEnv []string) {
-	workerID := uuid.NewString()[:8]
+func spawnWorker(ctx context.Context, log *slog.Logger, stateDir, runnerPath string, spec pipelinespec.Spec, slot int, workerID string, workerEnv []string) {
 	wLog := log.With("worker", workerID, "slot", slot)
 
 	workerDir := filepath.Join(stateDir, "workers", spec.Name)
@@ -261,6 +558,8 @@ type runtimeFile struct {
 	RunnerBin     string            `yaml:"runner_bin"`
 	WorktreesRoot string            `yaml:"worktrees_root"`
 	ClaudeHome    string            `yaml:"claude_home"`
+	MaxWorkers    int               `yaml:"max_workers"`
+	Budget        string            `yaml:"budget,omitempty"`
 	StartedAt     time.Time         `yaml:"started_at"`
 	PID           int               `yaml:"pid"`
 	Pipelines     []runtimePipeline `yaml:"pipelines"`
@@ -271,6 +570,7 @@ type runtimePipeline struct {
 	PoolSize     int           `yaml:"pool_size"`
 	TickInterval time.Duration `yaml:"tick_interval"`
 	StepTimeout  time.Duration `yaml:"step_timeout"`
+	Budget       string        `yaml:"budget,omitempty"`
 }
 
 func runtimeFilePath(stateDir string) string {
@@ -284,6 +584,8 @@ func writeRuntimeFile(cfg *pipelinespec.Config, configPath, runnerPath string) e
 		RunnerBin:     runnerPath,
 		WorktreesRoot: strings.TrimSpace(os.Getenv("WORKTREES_ROOT")),
 		ClaudeHome:    strings.TrimSpace(os.Getenv("CLAUDE_HOME")),
+		MaxWorkers:    cfg.MaxWorkers,
+		Budget:        cfg.Budget.String(),
 		StartedAt:     time.Now().UTC(),
 		PID:           os.Getpid(),
 	}
@@ -293,6 +595,7 @@ func writeRuntimeFile(cfg *pipelinespec.Config, configPath, runnerPath string) e
 			PoolSize:     p.PoolSize,
 			TickInterval: p.TickInterval,
 			StepTimeout:  p.StepTimeout,
+			Budget:       p.Budget.String(),
 		})
 	}
 	body, err := yaml.Marshal(r)

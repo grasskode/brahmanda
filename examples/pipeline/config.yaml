@@ -21,6 +21,12 @@
 state_dir: ~/.local/state/brahmanda-demo
 log_file: ""
 
+# Global cap on workers running at once across ALL three stages. The pool
+# is filled round-robin, so no single stage starves the others; each
+# stage still honours its own pool_size. The stages' pool sizes sum to 4
+# (1 + 2 + 1); a cap of 3 makes them share the pool round-robin.
+max_workers: 3
+
 pipelines:
   - name: build
     pool_size: 1
