@@ -66,6 +66,9 @@ func RenderOrchestrator(w io.Writer, s Snapshot) {
 		fmt.Fprintf(w, "  %s %d / %d workers busy (round-robin across pipelines)\n",
 			styleDim.Render("POOL:"), busy, s.MaxWorkers)
 	}
+	for _, note := range budgetHeldNotes(s) {
+		fmt.Fprintf(w, "  %s %s\n", styleErr.Render("BUDGET:"), styleErr.Render(note))
+	}
 }
 
 func RenderBackoff(w io.Writer, s Snapshot) {
@@ -141,7 +144,7 @@ func renderPipelines(w io.Writer, s Snapshot, withTokens bool) {
 	baseHdr := "  %-22s %6s %5s %8s %5s %10s %10s"
 	baseRow := "  %-22s %6s %5s %8s %5s %10s %10s"
 	hdrArgs := []any{"PIPELINE", "TICK", "RAN", "RUN/CAP", "ERR", "LAST ERR", "LAST OK"}
-	withBudget := len(s.PipelineBudgets) > 0
+	withBudget := len(s.PipelineBudgets) > 0 || s.GlobalBudget != nil
 	if withBudget {
 		baseHdr += " %16s"
 		baseRow += " %16s"
@@ -233,15 +236,21 @@ func renderPipelines(w io.Writer, s Snapshot, withTokens bool) {
 	if withTokens && len(s.Tokens.ByPhase) > 0 {
 		totalArgs := []any{"TOTAL", "-", "-", "-", "-", "-", "-"}
 		if withBudget {
-			totalArgs = append(totalArgs, "-")
+			// The global cap spans every pipeline, so it lives on the TOTAL
+			// row. A plain cell here (spent/cap) keeps its colour out of the
+			// way; when exceeded the whole row is tainted red below.
+			totalArgs = append(totalArgs, plainBudgetCell(s.GlobalBudget))
 		}
 		totalArgs = append(totalArgs, strconv.Itoa(totSess), FormatTokens(totIn), FormatTokens(totCacheR), FormatTokens(totOut))
 		if costAvail {
 			totalArgs = append(totalArgs, fmt.Sprintf("$%.2f", totCost))
 		}
-		fmt.Fprintf(w, baseRow, totalArgs...)
+		line := fmt.Sprintf(baseRow, totalArgs...)
+		if s.GlobalBudget != nil && s.GlobalBudget.Exceeded {
+			line = styleErr.Render(strings.TrimRight(line, "\n")) + "\n"
+		}
+		fmt.Fprint(w, line)
 	}
-	renderBudgetNotes(w, s)
 }
 
 // formatBudgetCell renders "$<spent>/<cap>" padded to the BUDGET column,
@@ -258,10 +267,22 @@ func formatBudgetCell(b BudgetStat) string {
 	return cell
 }
 
-// renderBudgetNotes prints one line per budget that is currently
-// holding launches, saying when it resets. Silent when nothing is held.
-func renderBudgetNotes(w io.Writer, s Snapshot) {
-	note := func(scope string, b BudgetStat) {
+// plainBudgetCell is formatBudgetCell without the exceeded colour, for
+// rows that carry their own row-level highlight. b may be nil (no cap).
+func plainBudgetCell(b *BudgetStat) string {
+	if b == nil || b.Limit.IsZero() {
+		return fmt.Sprintf("%16s", "-")
+	}
+	return fmt.Sprintf("%16s", fmt.Sprintf("$%.2f/%s", b.Spent, b.Limit.String()))
+}
+
+// budgetHeldNotes returns one line per budget currently holding launches,
+// each saying what is capped and when it resets. Empty when nothing is
+// held. Surfaced on the operator-health panel so a hold reads as a health
+// signal rather than table chrome.
+func budgetHeldNotes(s Snapshot) []string {
+	var notes []string
+	add := func(scope string, b BudgetStat) {
 		if !b.Exceeded {
 			return
 		}
@@ -269,10 +290,10 @@ func renderBudgetNotes(w io.Writer, s Snapshot) {
 		if !b.ResetAt.IsZero() {
 			reset = fmt.Sprintf("in %s (%s)", compactDuration(time.Until(b.ResetAt).Round(time.Minute)), b.ResetAt.Local().Format("15:04"))
 		}
-		fmt.Fprintln(w, styleErr.Render(fmt.Sprintf("  budget: %s exceeded %s ($%.2f spent) — launches held, resets %s", scope, b.Limit.String(), b.Spent, reset)))
+		notes = append(notes, fmt.Sprintf("budget: %s exceeded %s ($%.2f spent) — launches held, resets %s", scope, b.Limit.String(), b.Spent, reset))
 	}
 	if s.GlobalBudget != nil {
-		note("all pipelines", *s.GlobalBudget)
+		add("all pipelines", *s.GlobalBudget)
 	}
 	names := make([]string, 0, len(s.PipelineBudgets))
 	for name := range s.PipelineBudgets {
@@ -280,8 +301,9 @@ func renderBudgetNotes(w io.Writer, s Snapshot) {
 	}
 	sort.Strings(names)
 	for _, name := range names {
-		note(name, s.PipelineBudgets[name])
+		add(name, s.PipelineBudgets[name])
 	}
+	return notes
 }
 
 // compactDuration formats a tick interval as a short human label

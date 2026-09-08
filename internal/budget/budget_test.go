@@ -12,6 +12,42 @@ func hourly(amount float64) pipelinespec.Budget {
 	return pipelinespec.Budget{Amount: amount, Window: time.Hour}
 }
 
+func daily(amount float64) pipelinespec.Budget {
+	return pipelinespec.Budget{Amount: amount, Window: 24 * time.Hour}
+}
+
+// A daily cap counts only spend since local midnight — not a rolling
+// trailing 24h — and resets at the next local midnight.
+func TestStatusDailyResetsAtMidnight(t *testing.T) {
+	loc := time.Local
+	base := time.Now().In(loc)
+	y, m, d := base.Date()
+	midnight := time.Date(y, m, d, 0, 0, 0, 0, loc)
+	noon := time.Date(y, m, d, 12, 0, 0, 0, loc)
+
+	var l Ledger
+	l.Add(midnight.Add(-2*time.Hour), 30) // yesterday 22:00 — before the window
+	l.Add(midnight.Add(3*time.Hour), 20)  // today 03:00
+	l.Add(noon.Add(-time.Hour), 25)       // today 11:00
+
+	st := l.Status(daily(40), noon)
+	if st.Spent != 45 {
+		t.Fatalf("daily spent = %v, want 45 (yesterday's 30 excluded)", st.Spent)
+	}
+	if !st.Exceeded {
+		t.Fatalf("45 over a 40USD/d cap must be exceeded: %+v", st)
+	}
+	if want := midnight.AddDate(0, 0, 1); !st.ResetAt.Equal(want) {
+		t.Fatalf("ResetAt = %s, want next midnight %s", st.ResetAt, want)
+	}
+
+	// Just after midnight the day's spend has cleared.
+	after := l.Status(daily(40), st.ResetAt.Add(time.Second))
+	if after.Exceeded || after.Spent != 0 {
+		t.Fatalf("new day must start clear: %+v", after)
+	}
+}
+
 // Spend inside the window counts; spend that has aged out does not.
 func TestStatusWindowsSpend(t *testing.T) {
 	now := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)

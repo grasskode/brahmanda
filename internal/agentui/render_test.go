@@ -422,9 +422,10 @@ func TestLastPhaseNote_SurfacesSucceededNoteWithoutErrorFlag(t *testing.T) {
 	}
 }
 
-// A pipeline with a budget gets a BUDGET column showing spent/cap, and a
-// held budget adds a note line naming the reset instant.
-func TestRenderPipelines_BudgetColumnAndNote(t *testing.T) {
+// A pipeline with a budget gets a BUDGET column showing spent/cap. The
+// held-budget note moved to the operator-health panel, so the pipelines
+// table no longer carries it.
+func TestRenderPipelines_BudgetColumn(t *testing.T) {
 	now := time.Now()
 	s := Snapshot{
 		Since:      time.Hour,
@@ -452,12 +453,63 @@ func TestRenderPipelines_BudgetColumnAndNote(t *testing.T) {
 	if !strings.Contains(out, "$4.31/4USD/h") {
 		t.Errorf("missing spent/cap cell:\n%s", out)
 	}
-	if !strings.Contains(out, "budget: gh-code-review exceeded 4USD/h ($4.31 spent)") || !strings.Contains(out, "resets in 12m") {
-		t.Errorf("missing held-budget note with reset:\n%s", out)
+	if strings.Contains(out, "launches held") {
+		t.Errorf("held-budget note belongs on the orchestrator panel, not the pipelines table:\n%s", out)
 	}
 	for _, line := range strings.Split(out, "\n") {
 		if strings.HasPrefix(line, "  prune") && !strings.Contains(line, "-") {
 			t.Errorf("unbudgeted pipeline should show '-' in BUDGET: %q", line)
 		}
+	}
+}
+
+// The global daily cap rides the TOTAL row of the tokens overlay, and a
+// held cap taints that row red rather than adding a note under the table.
+func TestRenderPipelines_GlobalBudgetOnTotalRow(t *testing.T) {
+	s := Snapshot{
+		Since:         time.Hour,
+		SinceLabel:    "last 1h",
+		Pipelines:     []PipelineStat{{Name: "review", Ran: 2}},
+		PipelineOrder: []string{"review"},
+		GlobalBudget: &BudgetStat{
+			Limit:    pipelinespec.Budget{Amount: 40, Window: 24 * time.Hour},
+			Spent:    41.5,
+			Exceeded: true,
+			ResetAt:  time.Now().Add(3 * time.Hour),
+		},
+		Tokens: TokensPanel{
+			Available:     true,
+			CostAvailable: true,
+			ByPhase:       []tokens.Rollup{{Key: "review", Sessions: 2, Cost: 41.5}},
+		},
+	}
+	var b strings.Builder
+	RenderPipelinesWithTokens(&b, s)
+	out := b.String()
+	if !strings.Contains(out, "$41.50/40USD/d") {
+		t.Errorf("TOTAL row should carry the global daily cap:\n%s", out)
+	}
+	if strings.Contains(out, "launches held") {
+		t.Errorf("held note must not appear under the table:\n%s", out)
+	}
+}
+
+// The held-budget note surfaces on the operator-health panel.
+func TestRenderOrchestrator_BudgetHeldNote(t *testing.T) {
+	s := Snapshot{
+		Orchestrator: OrchestratorPanel{Alive: true, PID: "123"},
+		MaxWorkers:   4,
+		GlobalBudget: &BudgetStat{
+			Limit:    pipelinespec.Budget{Amount: 40, Window: 24 * time.Hour},
+			Spent:    41.5,
+			Exceeded: true,
+			ResetAt:  time.Now().Add(3 * time.Hour),
+		},
+	}
+	var b strings.Builder
+	RenderOrchestrator(&b, s)
+	out := b.String()
+	if !strings.Contains(out, "budget: all pipelines exceeded 40USD/d ($41.50 spent)") || !strings.Contains(out, "launches held") {
+		t.Errorf("orchestrator panel should carry the held-budget note:\n%s", out)
 	}
 }

@@ -53,10 +53,12 @@ type Config struct {
 	// workers never exceeds MaxWorkers.
 	MaxWorkers int `yaml:"max_workers"`
 
-	// Budget is an optional rolling spend cap across ALL pipelines, e.g.
-	// "40USD/d". When the cost workers reported inside the trailing window
-	// reaches it, no pipeline is launched until enough spend ages out.
-	// Per-pipeline Spec.Budget applies on top of it.
+	// Budget is an optional spend cap across ALL pipelines, e.g. "40USD/d".
+	// A daily cap ("/d") is a calendar-day window that counts spend since
+	// local midnight and resets at the next local midnight; an hourly cap
+	// ("/h") is a rolling trailing window. When the cost workers reported
+	// inside the window reaches the amount, no pipeline is launched until
+	// the window resets. Per-pipeline Spec.Budget applies on top of it.
 	Budget Budget `yaml:"budget"`
 
 	// Pipelines is the list of pipelines the orchestrator runs. Required;
@@ -95,12 +97,13 @@ type Spec struct {
 	// SIGTERM-then-SIGKILL.
 	StepTimeout time.Duration `yaml:"step_timeout"`
 
-	// Budget is an optional rolling spend cap for this pipeline, written
-	// as "<amount>USD/<h|d>" (e.g. "4USD/h"). The orchestrator sums the
-	// cost workers reported on their journal events over the trailing
-	// window and stops launching the pipeline while the sum is at or
-	// above the amount. In-flight workers are never interrupted. Zero
-	// means unlimited.
+	// Budget is an optional spend cap for this pipeline, written as
+	// "<amount>USD/<h|d>" (e.g. "4USD/h"). The orchestrator sums the cost
+	// workers reported on their journal events over the window — a rolling
+	// trailing hour for "/h", or the calendar day since local midnight for
+	// "/d" — and stops launching the pipeline while the sum is at or above
+	// the amount. In-flight workers are never interrupted. Zero means
+	// unlimited.
 	Budget Budget `yaml:"budget"`
 
 	// Command is the shell snippet that runs the worker. The runner
@@ -158,6 +161,11 @@ func ParseBudget(s string) (Budget, error) {
 
 // IsZero reports whether no cap is configured.
 func (b Budget) IsZero() bool { return b.Amount <= 0 || b.Window <= 0 }
+
+// IsDaily reports whether the cap covers a full calendar day ("/d").
+// Daily caps count spend since local midnight and reset at the next
+// local midnight; every other window is a rolling trailing one.
+func (b Budget) IsDaily() bool { return b.Window == 24*time.Hour }
 
 // String renders the canonical "<amount>USD/<h|d>" form; empty when zero.
 func (b Budget) String() string {
