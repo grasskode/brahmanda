@@ -369,6 +369,9 @@ func renderTasks(w io.Writer, s Snapshot, hidePruned bool) {
 			head += "  " + styleDim.Render(HumanAgo(r.LastUpdate)+" ago")
 		}
 		fmt.Fprintf(w, "  %s\n", head)
+		for _, line := range r.Logs {
+			fmt.Fprintf(w, "    %s\n", formatTaskLog(line))
+		}
 		if len(r.Chain) > 0 {
 			fmt.Fprintf(w, "    %s\n", formatChain(r.Chain))
 			if note, isErr := lastPhaseNote(r.Chain); note != "" {
@@ -445,7 +448,8 @@ func isPruned(r TaskStatusRow) bool {
 type TaskStatusRow struct {
 	TaskID     string
 	Chain      []PhaseStep
-	LastUpdate time.Time // timestamp of the task's most recent journal event
+	Logs       []TaskLogLine // task-scoped lines shown under the header, ahead of the chain
+	LastUpdate time.Time      // timestamp of the task's most recent journal event
 }
 
 // rowsFromTasks converts the journal-derived task chains into render
@@ -453,7 +457,7 @@ type TaskStatusRow struct {
 func rowsFromTasks(tasks []TaskRow) []TaskStatusRow {
 	out := make([]TaskStatusRow, 0, len(tasks))
 	for _, t := range tasks {
-		out = append(out, TaskStatusRow{TaskID: t.TaskID, Chain: t.Chain, LastUpdate: t.LastUpdate})
+		out = append(out, TaskStatusRow{TaskID: t.TaskID, Chain: t.Chain, Logs: t.Logs, LastUpdate: t.LastUpdate})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].TaskID < out[j].TaskID })
 	return out
@@ -468,6 +472,19 @@ func formatChain(chain []PhaseStep) string {
 		parts = append(parts, fmt.Sprintf("%s %s", styleDim.Render(step.Phase), OutcomeSymbol(step.Outcome)))
 	}
 	return strings.Join(parts, styleDim.Render(" → "))
+}
+
+// formatTaskLog renders one task-scoped log line as a bulleted line for
+// display under the task header. Error outcomes colour the whole line
+// red; anything else stays neutral so these lines read as status, not
+// alarms.
+func formatTaskLog(line TaskLogLine) string {
+	switch line.Outcome {
+	case journal.OutcomeFailed, journal.OutcomeTimedOut, journal.OutcomeDead:
+		return styleErr.Render("• " + line.Text)
+	default:
+		return styleInfo.Render("•") + " " + line.Text
+	}
 }
 
 // lastPhaseNote returns the latest pipeline phase's detail note as a

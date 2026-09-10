@@ -115,11 +115,30 @@ type PipelineStat struct {
 	LastSuccess time.Time // latest pipeline-level success
 }
 
-// TaskRow is one task's phase chain, ordered by first-seen phase.
+// taskLogPrefix marks a task-scoped log line. A worker emits an event
+// whose phase is "log:<key>" to float a line onto the task's row in the
+// monitor without pretending to be a pipeline stage: it never joins the
+// phase chain and never touches pool counters. <key> lets a worker that
+// runs every tick refresh the same line (latest note wins) instead of
+// stacking duplicates; distinct keys yield distinct lines.
+const taskLogPrefix = "log:"
+
+// TaskRow is one task's phase chain, ordered by first-seen phase, plus any
+// task-scoped log lines (see taskLogPrefix).
 type TaskRow struct {
 	TaskID     string
 	Chain      []PhaseStep
+	Logs       []TaskLogLine
 	LastUpdate time.Time // timestamp of the task's most recent journal event in the window
+}
+
+// TaskLogLine is one task-scoped log line surfaced under the task header,
+// ahead of the phase chain. Outcome only drives the line's colour; it is
+// not a pipeline outcome and is excluded from pool success/error counts.
+type TaskLogLine struct {
+	Key     string // the "log:<key>" the line was emitted under
+	Text    string
+	Outcome journal.Outcome
 }
 
 type PhaseStep struct {
@@ -543,13 +562,14 @@ func readPIDFile(path string) (int, bool) {
 	return pid, true
 }
 
-// collectTasks folds events by task_id, recording one chain entry per
-// pipeline (the journal carries fine-grained exec sub-events with
-// names like "exec:git:branch-delete" too; those are noise here and
-// get filtered out by requiring Phase == Pool, which is the runner's
-// convention for pipeline-level start/terminal events). Latest
-// outcome and note for each pipeline win, so the chain reflects the
-// final state of the most recent worker per pipeline.
+// collectTasks folds events by task_id into two lanes: the pipeline
+// chain (one entry per pipeline, keyed by Phase == Pool, the runner's
+// convention for pipeline-level start/terminal events) and task-scoped
+// log lines (Phase == "log:<key>", surfaced under the header). The
+// journal also carries fine-grained exec sub-events named like
+// "exec:git:branch-delete"; those belong to neither lane and are
+// dropped. Latest outcome and note win per phase and per log key, so
+// both lanes reflect the most recent worker's state.
 func (s *Snapshot) collectTasks(events []journal.Event) {
 	if len(events) == 0 {
 		return
@@ -559,6 +579,9 @@ func (s *Snapshot) collectTasks(events []journal.Event) {
 		seen     map[string]bool
 		outcomes map[string]journal.Outcome
 		notes    map[string]string
+		logOrder []string
+		logSeen  map[string]bool
+		logLines map[string]TaskLogLine
 		last     time.Time // newest event timestamp seen for this task
 	}
 	agg := map[string]*taskAgg{}
@@ -566,22 +589,43 @@ func (s *Snapshot) collectTasks(events []journal.Event) {
 		if ev.TaskID == syntheticTaskID {
 			continue // surfaced separately in SilentFailures
 		}
-		if ev.Phase != ev.Pool {
-			continue // fine-grained exec:* sub-event; not part of the pipeline chain
+		isChain := ev.Phase == ev.Pool
+		isLog := strings.HasPrefix(ev.Phase, taskLogPrefix)
+		if !isChain && !isLog {
+			continue // fine-grained exec:* sub-event; belongs to neither lane
 		}
 		t, ok := agg[ev.TaskID]
 		if !ok {
-			t = &taskAgg{seen: map[string]bool{}, outcomes: map[string]journal.Outcome{}, notes: map[string]string{}}
+			t = &taskAgg{
+				seen:     map[string]bool{},
+				outcomes: map[string]journal.Outcome{},
+				notes:    map[string]string{},
+				logSeen:  map[string]bool{},
+				logLines: map[string]TaskLogLine{},
+			}
 			agg[ev.TaskID] = t
 		}
-		if !t.seen[ev.Phase] {
-			t.seen[ev.Phase] = true
-			t.order = append(t.order, ev.Phase)
-		}
-		t.outcomes[ev.Phase] = ev.Outcome
-		t.notes[ev.Phase] = ev.Note
 		if ev.Timestamp.After(t.last) {
 			t.last = ev.Timestamp
+		}
+		if isChain {
+			if !t.seen[ev.Phase] {
+				t.seen[ev.Phase] = true
+				t.order = append(t.order, ev.Phase)
+			}
+			t.outcomes[ev.Phase] = ev.Outcome
+			t.notes[ev.Phase] = ev.Note
+			continue
+		}
+		// task-scoped log line, keyed by the full "log:<key>" phase.
+		if !t.logSeen[ev.Phase] {
+			t.logSeen[ev.Phase] = true
+			t.logOrder = append(t.logOrder, ev.Phase)
+		}
+		t.logLines[ev.Phase] = TaskLogLine{
+			Key:     strings.TrimPrefix(ev.Phase, taskLogPrefix),
+			Text:    ev.Note,
+			Outcome: ev.Outcome,
 		}
 	}
 	for taskID, t := range agg {
@@ -589,7 +633,13 @@ func (s *Snapshot) collectTasks(events []journal.Event) {
 		for _, ph := range t.order {
 			chain = append(chain, PhaseStep{Phase: ph, Outcome: t.outcomes[ph], Note: t.notes[ph]})
 		}
-		s.Tasks = append(s.Tasks, TaskRow{TaskID: taskID, Chain: chain, LastUpdate: t.last})
+		logs := make([]TaskLogLine, 0, len(t.logOrder))
+		for _, key := range t.logOrder {
+			if line := t.logLines[key]; line.Text != "" {
+				logs = append(logs, line)
+			}
+		}
+		s.Tasks = append(s.Tasks, TaskRow{TaskID: taskID, Chain: chain, Logs: logs, LastUpdate: t.last})
 	}
 	sort.Slice(s.Tasks, func(i, j int) bool { return s.Tasks[i].TaskID < s.Tasks[j].TaskID })
 }

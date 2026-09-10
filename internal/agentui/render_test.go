@@ -147,6 +147,39 @@ func TestCollectTasks_SkipsExecSubevents(t *testing.T) {
 	}
 }
 
+func TestCollectTasks_TaskLogLinesSeparateFromChain(t *testing.T) {
+	// A "log:<key>" phase floats a task-scoped line under the header
+	// without joining the chain; re-emitting the same key refreshes the
+	// line in place, and it never reaches the pipeline error/success fold.
+	events := []journal.Event{
+		{TaskID: "QUA-1", Pool: "investigate", Phase: "log:donottouch", Outcome: journal.OutcomeSucceeded, Note: "frozen (stale)"},
+		{TaskID: "QUA-1", Pool: "investigate", Phase: "log:donottouch", Outcome: journal.OutcomeSucceeded, Note: "frozen by .agent/donottouch — worker skipped"},
+		{TaskID: "QUA-1", Pool: "review", Phase: "log:note", Outcome: journal.OutcomeSucceeded, Note: "second line"},
+	}
+	var s Snapshot
+	s.collectTasks(events)
+	s.collectPipelines(events)
+
+	if len(s.Tasks) != 1 {
+		t.Fatalf("want one task row, got %+v", s.Tasks)
+	}
+	row := s.Tasks[0]
+	if len(row.Chain) != 0 {
+		t.Errorf("log: events must not join the chain; got %+v", row.Chain)
+	}
+	if len(row.Logs) != 2 {
+		t.Fatalf("want two task-log lines (one per key), got %+v", row.Logs)
+	}
+	if row.Logs[0].Key != "donottouch" || row.Logs[0].Text != "frozen by .agent/donottouch — worker skipped" {
+		t.Errorf("latest note per key should win: %+v", row.Logs[0])
+	}
+	for _, p := range s.Pipelines {
+		if p.Errors != 0 || !p.LastSuccess.IsZero() {
+			t.Errorf("task-log events must not touch pool counters: %+v", p)
+		}
+	}
+}
+
 func TestLastPhaseNote_FormatsAndTruncates(t *testing.T) {
 	chain := []PhaseStep{
 		{Phase: "investigate", Outcome: journal.OutcomeSucceeded, Note: "verdict=clear"},
