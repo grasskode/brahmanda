@@ -123,8 +123,9 @@ type PipelineStat struct {
 // stacking duplicates; distinct keys yield distinct lines.
 const taskLogPrefix = "log:"
 
-// TaskRow is one task's phase chain, ordered by first-seen phase, plus any
-// task-scoped log lines (see taskLogPrefix).
+// TaskRow is one task's phase chain, ordered by the configured pipeline
+// order (first-seen for phases outside it), plus any task-scoped log lines
+// (see taskLogPrefix).
 type TaskRow struct {
 	TaskID     string
 	Chain      []PhaseStep
@@ -149,6 +150,11 @@ type PhaseStep struct {
 	// renderer suppresses notes on succeeded phases to keep the chain
 	// scannable.
 	Note string
+	// LastAt is the timestamp of this phase's most recent event. The
+	// renderer picks a task's current stage by newest LastAt rather than
+	// by chain position, so a windowed or out-of-order chain still
+	// reports the latest activity.
+	LastAt time.Time
 }
 
 type TokensPanel struct {
@@ -569,16 +575,25 @@ func readPIDFile(path string) (int, bool) {
 // journal also carries fine-grained exec sub-events named like
 // "exec:git:branch-delete"; those belong to neither lane and are
 // dropped. Latest outcome and note win per phase and per log key, so
-// both lanes reflect the most recent worker's state.
+// both lanes reflect the most recent worker's state. The chain is
+// ordered by the configured pipeline order so it reads as the pipeline
+// regardless of the lookback window; phases outside that order (or when
+// no orchestrator config is loaded) keep first-seen order, after the
+// known ones.
 func (s *Snapshot) collectTasks(events []journal.Event) {
 	if len(events) == 0 {
 		return
+	}
+	rank := make(map[string]int, len(s.PipelineOrder))
+	for i, name := range s.PipelineOrder {
+		rank[name] = i
 	}
 	type taskAgg struct {
 		order    []string
 		seen     map[string]bool
 		outcomes map[string]journal.Outcome
 		notes    map[string]string
+		phaseAt  map[string]time.Time // newest event timestamp per chain phase
 		logOrder []string
 		logSeen  map[string]bool
 		logLines map[string]TaskLogLine
@@ -600,6 +615,7 @@ func (s *Snapshot) collectTasks(events []journal.Event) {
 				seen:     map[string]bool{},
 				outcomes: map[string]journal.Outcome{},
 				notes:    map[string]string{},
+				phaseAt:  map[string]time.Time{},
 				logSeen:  map[string]bool{},
 				logLines: map[string]TaskLogLine{},
 			}
@@ -615,6 +631,9 @@ func (s *Snapshot) collectTasks(events []journal.Event) {
 			}
 			t.outcomes[ev.Phase] = ev.Outcome
 			t.notes[ev.Phase] = ev.Note
+			if ev.Timestamp.After(t.phaseAt[ev.Phase]) {
+				t.phaseAt[ev.Phase] = ev.Timestamp
+			}
 			continue
 		}
 		// task-scoped log line, keyed by the full "log:<key>" phase.
@@ -629,9 +648,13 @@ func (s *Snapshot) collectTasks(events []journal.Event) {
 		}
 	}
 	for taskID, t := range agg {
-		chain := make([]PhaseStep, 0, len(t.order))
-		for _, ph := range t.order {
-			chain = append(chain, PhaseStep{Phase: ph, Outcome: t.outcomes[ph], Note: t.notes[ph]})
+		ordered := append([]string(nil), t.order...)
+		sort.SliceStable(ordered, func(i, j int) bool {
+			return phaseRank(rank, ordered[i]) < phaseRank(rank, ordered[j])
+		})
+		chain := make([]PhaseStep, 0, len(ordered))
+		for _, ph := range ordered {
+			chain = append(chain, PhaseStep{Phase: ph, Outcome: t.outcomes[ph], Note: t.notes[ph], LastAt: t.phaseAt[ph]})
 		}
 		logs := make([]TaskLogLine, 0, len(t.logOrder))
 		for _, key := range t.logOrder {
@@ -642,6 +665,17 @@ func (s *Snapshot) collectTasks(events []journal.Event) {
 		s.Tasks = append(s.Tasks, TaskRow{TaskID: taskID, Chain: chain, Logs: logs, LastUpdate: t.last})
 	}
 	sort.Slice(s.Tasks, func(i, j int) bool { return s.Tasks[i].TaskID < s.Tasks[j].TaskID })
+}
+
+// phaseRank returns phase's index in the configured pipeline order, or a
+// sentinel one past the end for phases absent from it — so unknown phases
+// sort after the known ones while a stable sort preserves their first-seen
+// order among themselves.
+func phaseRank(rank map[string]int, phase string) int {
+	if r, ok := rank[phase]; ok {
+		return r
+	}
+	return len(rank)
 }
 
 // collectTokens rolls up the cost and usage workers reported in the

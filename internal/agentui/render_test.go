@@ -180,6 +180,60 @@ func TestCollectTasks_TaskLogLinesSeparateFromChain(t *testing.T) {
 	}
 }
 
+func TestCollectTasks_PipelineOrderAndRecencyOverrideHeldBurst(t *testing.T) {
+	// Regression for QUA-1672: a merged+pruned task whose earlier
+	// donottouch freeze stamped a synchronized "HELD" event onto every
+	// pool. With a window that clips the task's early stages, the earliest
+	// in-window events are that burst — so first-seen order would put an
+	// arbitrary burst phase (here investigate, last in the burst) at the
+	// end of the chain and surface its stale HELD note as the headline.
+	// The chain must still read in pipeline order, and the stage/note must
+	// follow the newest real event (prune removed), not the burst.
+	burst := time.Date(2026, 9, 10, 10, 48, 29, 0, time.UTC)
+	held := func(pool string, off time.Duration) journal.Event {
+		return journal.Event{
+			Timestamp: burst.Add(off), TaskID: "QUA-1672", Pool: pool, Phase: pool,
+			Outcome: journal.OutcomeSucceeded, Note: "HELD — .agent/donottouch present; worker skipped",
+		}
+	}
+	events := []journal.Event{
+		held("prune", 1),
+		held("github-notify", 2),
+		held("implement", 3),
+		held("finalize", 4),
+		held("investigate", 5), // first (and only) in-window investigate event lands last in the burst
+		{Timestamp: burst.Add(45 * time.Minute), TaskID: "QUA-1672", Pool: "finalize", Phase: "finalize", Outcome: journal.OutcomeSucceeded, Note: "merged · prod confirmed — prune-ok written"},
+		{Timestamp: burst.Add(46 * time.Minute), TaskID: "QUA-1672", Pool: "prune", Phase: "prune", Outcome: journal.OutcomeSucceeded, Note: "worktree removed"},
+	}
+	s := Snapshot{PipelineOrder: []string{"prepare-worktree", "investigate", "implement", "review", "github-notify", "finalize", "prune"}}
+	s.collectTasks(events)
+
+	if len(s.Tasks) != 1 {
+		t.Fatalf("want one task row, got %+v", s.Tasks)
+	}
+	row := s.Tasks[0]
+
+	var phases []string
+	for _, st := range row.Chain {
+		phases = append(phases, st.Phase)
+	}
+	if got, want := strings.Join(phases, ","), "investigate,implement,github-notify,finalize,prune"; got != want {
+		t.Errorf("chain order = %q, want pipeline order %q", got, want)
+	}
+
+	tr := TaskStatusRow{TaskID: row.TaskID, Chain: row.Chain}
+	if got := stageForRow(tr); got != "prune done" {
+		t.Errorf("stage = %q, want \"prune done\" (newest real event), not the HELD burst", got)
+	}
+	if !isPruned(tr) {
+		t.Error("isPruned = false, want true — prune succeeded is the most recent phase")
+	}
+	note, isErr := lastPhaseNote(row.Chain)
+	if isErr || !strings.Contains(note, "worktree removed") {
+		t.Errorf("note = %q (isErr=%v), want the prune removal note, not the stale HELD line", note, isErr)
+	}
+}
+
 func TestLastPhaseNote_FormatsAndTruncates(t *testing.T) {
 	chain := []PhaseStep{
 		{Phase: "investigate", Outcome: journal.OutcomeSucceeded, Note: "verdict=clear"},

@@ -401,17 +401,35 @@ func stylizeStage(s string) string {
 	}
 }
 
+// latestStep returns the chain step whose most recent event is newest —
+// a task's current stage by real recency, not by chain position. Ties
+// (equal or zero timestamps) resolve to the later step, which — because
+// the chain is in pipeline order — is the furthest-progressed stage.
+// Returns false for an empty chain.
+func latestStep(chain []PhaseStep) (PhaseStep, bool) {
+	if len(chain) == 0 {
+		return PhaseStep{}, false
+	}
+	best := 0
+	for i := 1; i < len(chain); i++ {
+		if !chain[i].LastAt.Before(chain[best].LastAt) {
+			best = i
+		}
+	}
+	return chain[best], true
+}
+
 // stageForRow returns the operator-facing one-line stage label for a
-// task: its latest pipeline phase tagged with that phase's outcome. It
-// is a pure projection of the journal chain — no worktree/marker
-// inputs, no per-phase semantics. The phase name and any detail note
-// (rendered separately) carry the meaning; the monitor only reports
-// what ran and how it ended.
+// task: its most recently active pipeline phase tagged with that phase's
+// outcome. It is a pure projection of the journal chain — no
+// worktree/marker inputs, no per-phase semantics. The phase name and any
+// detail note (rendered separately) carry the meaning; the monitor only
+// reports what ran and how it ended.
 func stageForRow(r TaskStatusRow) string {
-	if len(r.Chain) == 0 {
+	last, ok := latestStep(r.Chain)
+	if !ok {
 		return ""
 	}
-	last := r.Chain[len(r.Chain)-1]
 	switch last.Outcome {
 	case journal.OutcomeStarted:
 		return last.Phase + " in progress"
@@ -427,16 +445,13 @@ func stageForRow(r TaskStatusRow) string {
 	return last.Phase
 }
 
-// isPruned reports whether a row's chain ends in `prune succeeded` —
-// the journal evidence that the terminal pipeline has shipped this
-// task. Keyed on the journal's own phase/outcome vocabulary (the
-// orchestrator's contract), not on any worktree marker.
+// isPruned reports whether a row's most recent phase is `prune
+// succeeded` — the journal evidence that the terminal pipeline has
+// shipped this task. Keyed on the journal's own phase/outcome vocabulary
+// (the orchestrator's contract), not on any worktree marker.
 func isPruned(r TaskStatusRow) bool {
-	if len(r.Chain) == 0 {
-		return false
-	}
-	last := r.Chain[len(r.Chain)-1]
-	return last.Phase == "prune" && last.Outcome == journal.OutcomeSucceeded
+	last, ok := latestStep(r.Chain)
+	return ok && last.Phase == "prune" && last.Outcome == journal.OutcomeSucceeded
 }
 
 // TaskStatusRow is one task's status as projected from the journal: the
@@ -449,7 +464,7 @@ type TaskStatusRow struct {
 	TaskID     string
 	Chain      []PhaseStep
 	Logs       []TaskLogLine // task-scoped lines shown under the header, ahead of the chain
-	LastUpdate time.Time      // timestamp of the task's most recent journal event
+	LastUpdate time.Time     // timestamp of the task's most recent journal event
 }
 
 // rowsFromTasks converts the journal-derived task chains into render
@@ -487,18 +502,18 @@ func formatTaskLog(line TaskLogLine) string {
 	}
 }
 
-// lastPhaseNote returns the latest pipeline phase's detail note as a
-// single trimmed line, plus whether that phase ended in a failure
-// (failed/timed_out/dead) so the caller can colour it. The note is the
-// journal Note field verbatim — the monitor never parses it, just
+// lastPhaseNote returns the most recently active pipeline phase's detail
+// note as a single trimmed line, plus whether that phase ended in a
+// failure (failed/timed_out/dead) so the caller can colour it. The note
+// is the journal Note field verbatim — the monitor never parses it, just
 // surfaces whatever the worker reported ("PR opened: …", "verdict=…",
 // "awaiting prod deploy: …", a failure reason). Any "stderr tail" block
 // is trimmed and newlines flattened so it fits one panel row.
 func lastPhaseNote(chain []PhaseStep) (string, bool) {
-	if len(chain) == 0 {
+	last, ok := latestStep(chain)
+	if !ok {
 		return "", false
 	}
-	last := chain[len(chain)-1]
 	isErr := false
 	switch last.Outcome {
 	case journal.OutcomeFailed, journal.OutcomeTimedOut, journal.OutcomeDead:

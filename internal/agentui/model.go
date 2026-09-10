@@ -682,10 +682,11 @@ func (m Model) panelBorderHue(id PanelID) lipgloss.Color {
 		}
 	case PanelTasks:
 		for _, t := range m.snap.Tasks {
-			if len(t.Chain) == 0 {
+			last, ok := latestStep(t.Chain)
+			if !ok {
 				continue
 			}
-			switch t.Chain[len(t.Chain)-1].Outcome {
+			switch last.Outcome {
 			case journal.OutcomeFailed, journal.OutcomeTimedOut, journal.OutcomeDead:
 				return colorBusy
 			}
