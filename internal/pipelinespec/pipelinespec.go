@@ -112,6 +112,14 @@ type Spec struct {
 	// AGENT_WORKER_ID, AGENT_STATE_ROOT, AGENT_WORKER_INDEX into the
 	// environment before exec; the operator's shell env propagates too.
 	Command string `yaml:"command"`
+
+	// Env is an optional per-pipeline environment overlay for this
+	// pipeline's workers, applied on top of the global env_file (so a key
+	// here overrides the same key there). It lets the operator set any env
+	// var for just one pipeline's workers without a global env_file entry;
+	// the orchestrator does not interpret the keys. Keys must be shell-safe
+	// names and may not be AGENT_* (reserved by the runner).
+	Env map[string]string `yaml:"env"`
 }
 
 const (
@@ -295,7 +303,24 @@ func (s *Spec) validate() error {
 	if s.Command == "" {
 		return fmt.Errorf("command is required")
 	}
+	for k := range s.Env {
+		if err := validateEnvKey(k); err != nil {
+			return fmt.Errorf("env: %w", err)
+		}
+	}
 	return nil
+}
+
+// WorkerEnvPairs returns this pipeline's env overlay as sorted KEY=value
+// strings, to layer on top of the global env_file pairs. Empty when the
+// pipeline declares no env.
+func (s *Spec) WorkerEnvPairs() []string {
+	pairs := make([]string, 0, len(s.Env))
+	for k, v := range s.Env {
+		pairs = append(pairs, k+"="+v)
+	}
+	sort.Strings(pairs)
+	return pairs
 }
 
 // envKeyRE bounds an environment variable name to a POSIX-shell-safe

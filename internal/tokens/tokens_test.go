@@ -161,6 +161,56 @@ func TestCollectReportedCostAndUsage(t *testing.T) {
 	}
 }
 
+func TestCollectByPhaseModel(t *testing.T) {
+	stateRoot := t.TempDir()
+	ts := time.Now().Add(-time.Hour).UTC()
+	emit := func(phase, sid, model string, usage *journal.Usage, offset time.Duration) {
+		ev := journal.Event{
+			Timestamp: ts.Add(offset), TaskID: "QUA-1", WorkerID: "w", Pool: phase,
+			Phase: phase, Outcome: journal.OutcomeStarted,
+			Agent: &journal.AgentSession{Runtime: "claude", Model: model, SessionID: sid, Usage: usage},
+		}
+		if err := journal.Append(stateRoot, ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// finalize spans two models (a before/after downgrade); implement has one;
+	// one untagged session must still show under its phase as "(unknown)". A
+	// post-run report with an empty model must not wipe the breadcrumb's model.
+	emit("finalize", "f1", "claude-opus-4-8", &journal.Usage{InputTokens: 100}, 0)
+	emit("finalize", "f1", "", &journal.Usage{OutputTokens: 50}, time.Minute)
+	emit("finalize", "f2", "claude-sonnet-5", &journal.Usage{InputTokens: 60}, 2*time.Minute)
+	emit("implement", "i1", "claude-opus-4-8", &journal.Usage{InputTokens: 200}, 0)
+	emit("implement", "i2", "", &journal.Usage{InputTokens: 5}, time.Minute)
+
+	res, err := Collect(context.Background(), Options{StateRoot: stateRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fin := map[string]Rollup{}
+	for _, r := range res.ByPhaseModel["finalize"] {
+		fin[r.Key] = r
+	}
+	if len(fin) != 2 {
+		t.Fatalf("finalize should split into 2 models, got %+v", res.ByPhaseModel["finalize"])
+	}
+	if fin["claude-opus-4-8"].Sessions != 1 || fin["claude-sonnet-5"].Sessions != 1 {
+		t.Errorf("finalize model split wrong: %+v", fin)
+	}
+	// f1 keeps opus despite the later empty-model report.
+	if got := fin["claude-opus-4-8"].Usage; got.InputTokens != 100 || got.OutputTokens != 50 {
+		t.Errorf("f1 opus usage = %+v, want input 100 / output 50 (empty report must not reassign model)", got)
+	}
+	impl := map[string]Rollup{}
+	for _, r := range res.ByPhaseModel["implement"] {
+		impl[r.Key] = r
+	}
+	if _, ok := impl["(unknown)"]; !ok {
+		t.Errorf("untagged implement session must show as (unknown): %+v", res.ByPhaseModel["implement"])
+	}
+}
+
 // A session that never reported falls back to its jsonl for tokens only,
 // counting each API message once even though the log repeats the same
 // usage on every content-block line of a response.

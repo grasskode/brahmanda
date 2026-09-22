@@ -121,6 +121,38 @@ func TestRenderTokens_NoRowsSkipsTotal(t *testing.T) {
 	}
 }
 
+func TestRenderTokens_ModelSubRows(t *testing.T) {
+	s := Snapshot{
+		Tokens: TokensPanel{
+			Available: true,
+			Note:      "last 6h",
+			ByPhase:   []tokens.Rollup{{Key: "finalize", Sessions: 2, Usage: tokens.Usage{InputTokens: 160}}},
+			ByPhaseModel: map[string][]tokens.Rollup{
+				"finalize": {
+					{Key: "claude-opus-4-8", Sessions: 1, Usage: tokens.Usage{InputTokens: 100}},
+					{Key: "claude-sonnet-5", Sessions: 1, Usage: tokens.Usage{InputTokens: 60}},
+				},
+			},
+		},
+	}
+	var b strings.Builder
+	RenderTokens(&b, s)
+	out := b.String()
+
+	if !strings.Contains(out, "finalize") {
+		t.Fatalf("expected the phase row in:\n%s", out)
+	}
+	// Both models appear as indented sub-rows beneath the phase.
+	for _, model := range []string{"claude-opus-4-8", "claude-sonnet-5"} {
+		if !strings.Contains(out, model) {
+			t.Errorf("expected model sub-row %q in:\n%s", model, out)
+		}
+		if strings.Index(out, model) < strings.Index(out, "finalize") {
+			t.Errorf("model sub-row %q must follow its phase row:\n%s", model, out)
+		}
+	}
+}
+
 func TestCollectTasks_SkipsExecSubevents(t *testing.T) {
 	// Mirrors a real QUA-213 prune sequence: the worker emitted a
 	// failed exec:git:branch-delete sub-event before its own

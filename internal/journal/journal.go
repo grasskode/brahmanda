@@ -64,8 +64,10 @@ type Event struct {
 }
 
 // AgentSession identifies one run of an agent runtime. Runtime names
-// the agent (e.g. "claude"); SessionID is that runtime's own session
-// identifier, which locates the run's usage log.
+// the agent (e.g. "claude"); Model is the model it ran (empty when the
+// runtime is not model-parameterised), letting burn be attributed by
+// model; SessionID is that runtime's own session identifier, which
+// locates the run's usage log.
 //
 // CostUSD and Usage are what the run cost, as reported by the runtime's
 // own accounting (claude's result envelope). A worker emits them on an
@@ -74,6 +76,7 @@ type Event struct {
 // reports each run separately and readers sum them.
 type AgentSession struct {
 	Runtime   string  `json:"runtime"`
+	Model     string  `json:"model,omitempty"`
 	SessionID string  `json:"session_id"`
 	CostUSD   float64 `json:"cost_usd,omitempty"`
 	Usage     *Usage  `json:"usage,omitempty"`

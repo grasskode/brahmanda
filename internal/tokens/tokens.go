@@ -37,6 +37,7 @@ type Usage = journal.Usage
 type Session struct {
 	SessionID string
 	Runtime   string    // agent runtime that ran the session, e.g. "claude"
+	Model     string    // model the session ran (from the journal); empty if unknown
 	Phase     string    // phase from the journal: investigate, implement, ...
 	TaskID    string    // identifier the session ran under (e.g. CHG-42 / user--CHG-42)
 	StartedAt time.Time // timestamp of the earliest journal event for this session
@@ -66,10 +67,15 @@ type Options struct {
 // ByPhase groups across all (matching) tasks; ByTask groups across all
 // phases; Sessions is the raw join for callers that want full control.
 type Result struct {
-	Sessions      []Session // per-session detail, sorted oldest-first
-	ByPhase       []Rollup  // grouped + sorted by total token burn desc
-	ByTask        []Rollup  // grouped + sorted by total token burn desc
-	CostAvailable bool      // true when at least one session reported its cost
+	Sessions []Session // per-session detail, sorted oldest-first
+	ByPhase  []Rollup  // grouped + sorted by total token burn desc
+	ByTask   []Rollup  // grouped + sorted by total token burn desc
+	// ByPhaseModel breaks each phase down by the model its sessions ran,
+	// so burn can be attributed to a model within the pipeline that spent
+	// it (a phase that changed models shows one row per model). Keyed by
+	// phase; each slice sorted by burn desc, "(unknown)" for untagged.
+	ByPhaseModel  map[string][]Rollup
+	CostAvailable bool // true when at least one session reported its cost
 }
 
 // Collect reads the orchestrator journal for agent-tagged events, sums
@@ -102,6 +108,11 @@ func Collect(ctx context.Context, opts Options) (Result, error) {
 		}
 		if !e.Timestamp.After(s.StartedAt) || s.Phase == "" {
 			s.Runtime, s.Phase, s.TaskID, s.StartedAt = e.Agent.Runtime, e.Phase, e.TaskID, e.Timestamp
+		}
+		// Model rides the pre-run breadcrumb; a later post-run report may
+		// omit it, so only overwrite from an event that actually carries one.
+		if e.Agent.Model != "" {
+			s.Model = e.Agent.Model
 		}
 		if e.Agent.CostUSD > 0 || (e.Agent.Usage != nil && !e.Agent.Usage.IsZero()) {
 			s.Reported = true
@@ -138,7 +149,27 @@ func Collect(ctx context.Context, opts Options) (Result, error) {
 
 	out.ByPhase = rollupBy(out.Sessions, func(s Session) string { return s.Phase })
 	out.ByTask = rollupBy(out.Sessions, func(s Session) string { return s.TaskID })
+
+	// Per-phase model breakdown: group each phase's sessions by model.
+	byPhase := map[string][]Session{}
+	for _, s := range out.Sessions {
+		byPhase[s.Phase] = append(byPhase[s.Phase], s)
+	}
+	out.ByPhaseModel = make(map[string][]Rollup, len(byPhase))
+	for phase, ss := range byPhase {
+		out.ByPhaseModel[phase] = rollupBy(ss, modelKey)
+	}
 	return out, nil
+}
+
+// modelKey buckets a session by the model it ran, folding untagged
+// sessions into "(unknown)" rather than dropping them (an empty key
+// would be skipped by rollupBy).
+func modelKey(s Session) string {
+	if s.Model == "" {
+		return "(unknown)"
+	}
+	return s.Model
 }
 
 // rollupBy groups sessions by the key returned by keyFn and sorts the

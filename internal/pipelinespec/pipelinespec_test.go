@@ -184,6 +184,9 @@ func TestLoadFile_PipelineValidation(t *testing.T) {
 		{"pool-size-negative", `pipelines: [{name: ok, command: ./x, pool_size: -1}]`, "pool_size must be >= 1"},
 		{"tick-too-small", `pipelines: [{name: ok, command: ./x, tick_interval: 100ms}]`, "tick_interval must be >= 1s"},
 		{"timeout-too-small", `pipelines: [{name: ok, command: ./x, step_timeout: 100ms}]`, "step_timeout must be >= 1s"},
+		{"env-ok", `pipelines: [{name: ok, command: ./x, env: {CLAUDE_MODEL: claude-sonnet-5}}]`, ""},
+		{"env-bad-key", "pipelines: [{name: ok, command: ./x, env: {\"bad key\": v}}]", "invalid env name"},
+		{"env-agent-reserved", `pipelines: [{name: ok, command: ./x, env: {AGENT_FOO: bar}}]`, "reserved"},
 	}
 	for _, c := range cases {
 		t.Run(c.label, func(t *testing.T) {
@@ -199,6 +202,36 @@ func TestLoadFile_PipelineValidation(t *testing.T) {
 				t.Fatalf("expected error containing %q, got %v", c.wantError, err)
 			}
 		})
+	}
+}
+
+func TestLoadFile_PerPipelineEnv(t *testing.T) {
+	path := writeConfig(t, t.TempDir(), "config.yaml", `
+max_workers: 4
+pipelines:
+  - name: finalize
+    command: ./x
+    env:
+      CLAUDE_MODEL: claude-sonnet-5
+      FOO: bar
+  - name: implement
+    command: ./y
+`)
+	cfg, err := LoadFile(path)
+	if err != nil {
+		t.Fatalf("LoadFile: %v", err)
+	}
+	if got := cfg.Pipelines[0].Env["CLAUDE_MODEL"]; got != "claude-sonnet-5" {
+		t.Errorf("finalize env[CLAUDE_MODEL] = %q, want claude-sonnet-5", got)
+	}
+	// WorkerEnvPairs is sorted KEY=value.
+	pairs := cfg.Pipelines[0].WorkerEnvPairs()
+	want := []string{"CLAUDE_MODEL=claude-sonnet-5", "FOO=bar"}
+	if len(pairs) != len(want) || pairs[0] != want[0] || pairs[1] != want[1] {
+		t.Errorf("WorkerEnvPairs = %v, want %v", pairs, want)
+	}
+	if p := cfg.Pipelines[1].WorkerEnvPairs(); len(p) != 0 {
+		t.Errorf("pipeline with no env should yield no pairs, got %v", p)
 	}
 }
 

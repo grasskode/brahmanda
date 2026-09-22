@@ -519,9 +519,13 @@ func spawnWorker(ctx context.Context, log *slog.Logger, stateDir, runnerPath str
 	cmd.Stderr = logFile
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	// Overlay the config-declared env on top of brahma's inherited
-	// process environment; config wins on key collisions. srishti
+	// process environment; config wins on key collisions. The pipeline's
+	// own env: is layered last, so it overrides the global env_file for
+	// this pipeline's workers. A fresh slice per spawn keeps the shared
+	// workerEnv slice unmutated across concurrent pipelines. srishti
 	// inherits this and passes it to the worker (then adds AGENT_*).
-	cmd.Env = workerEnviron(workerEnv)
+	overlay := append(append([]string{}, workerEnv...), spec.WorkerEnvPairs()...)
+	cmd.Env = workerEnviron(overlay)
 
 	start := time.Now()
 	if err := cmd.Start(); err != nil {

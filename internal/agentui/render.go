@@ -185,19 +185,30 @@ func renderPipelines(w io.Writer, s Snapshot, withTokens bool) {
 		// Pad each value to its column width FIRST, then wrap in
 		// colour — ANSI escape bytes don't print but still count toward
 		// %Ns padding, so colouring before padding skews the layout.
-		paddedErr := fmt.Sprintf("%5d", p.Errors)
-		if p.Errors > 0 {
-			paddedErr = styleErr.Render(paddedErr)
-		} else {
-			paddedErr = styleDim.Render(paddedErr)
-		}
+		// ERR count is a running total, not a live signal — keep it neutral.
+		paddedErr := styleDim.Render(fmt.Sprintf("%5d", p.Errors))
+		// LAST ERR / LAST OK colour only the one that was the pipeline's most
+		// recent outcome: a pipeline that has since succeeded shows OK in green
+		// and its older error greyed out, and vice versa.
+		errIsLast := !p.LastError.IsZero() && p.LastError.After(p.LastSuccess)
+		okIsLast := !p.LastSuccess.IsZero() && p.LastSuccess.After(p.LastError)
 		lastErr := fmt.Sprintf("%10s", "-")
 		if !p.LastError.IsZero() {
-			lastErr = styleErr.Render(fmt.Sprintf("%10s", HumanAgo(p.LastError)+" ago"))
+			txt := fmt.Sprintf("%10s", HumanAgo(p.LastError)+" ago")
+			if errIsLast {
+				lastErr = styleErr.Render(txt)
+			} else {
+				lastErr = styleDim.Render(txt)
+			}
 		}
 		lastOK := fmt.Sprintf("%10s", "-")
 		if !p.LastSuccess.IsZero() {
-			lastOK = styleOK.Render(fmt.Sprintf("%10s", HumanAgo(p.LastSuccess)+" ago"))
+			txt := fmt.Sprintf("%10s", HumanAgo(p.LastSuccess)+" ago")
+			if okIsLast {
+				lastOK = styleOK.Render(txt)
+			} else {
+				lastOK = styleDim.Render(txt)
+			}
 		}
 		// runCap column highlighted when the pool has live workers.
 		paddedRunCap := fmt.Sprintf("%8s", runCap)
@@ -231,6 +242,31 @@ func renderPipelines(w io.Writer, s Snapshot, withTokens bool) {
 			}
 		}
 		fmt.Fprintf(w, baseRow, row...)
+
+		// Break the pipeline's burn down by the model its sessions ran, as
+		// indented sub-rows — the burn attributed to each model within this
+		// pipeline. Non-token columns are blank; sub-rows don't re-sum into
+		// the TOTAL (the pipeline row already counted them).
+		if withTokens {
+			for _, m := range s.Tokens.ByPhaseModel[p.Name] {
+				sub := []any{"  " + m.Key, "", "", "", "", "", ""}
+				if withBudget {
+					sub = append(sub, "")
+				}
+				subCost := "-"
+				if costAvail {
+					subCost = fmt.Sprintf("$%.2f", m.Cost)
+				}
+				sub = append(sub, strconv.Itoa(m.Sessions),
+					FormatTokens(m.Usage.InputTokens),
+					FormatTokens(m.Usage.CacheReadTokens),
+					FormatTokens(m.Usage.OutputTokens))
+				if costAvail {
+					sub = append(sub, subCost)
+				}
+				fmt.Fprintf(w, baseRow, sub...)
+			}
+		}
 	}
 
 	if withTokens && len(s.Tokens.ByPhase) > 0 {
@@ -876,22 +912,27 @@ func humanBytes(n int64) string {
 	}
 }
 
+// RenderTokens prints the token-burn table grouped by phase, with each
+// phase's models listed as indented sub-rows beneath it (so burn can be
+// attributed to the model that spent it — a phase that ran more than one
+// model shows one sub-row per model).
 func RenderTokens(w io.Writer, s Snapshot) {
 	fmt.Fprintf(w, "TOKEN BURN (%s)\n", s.Tokens.Note)
-	if !s.Tokens.Available {
+	if !s.Tokens.Available || len(s.Tokens.ByPhase) == 0 {
 		return
 	}
+	cost := s.Tokens.CostAvailable
 	header := "  %-22s %5s %7s %8s %8s %8s"
 	rowFmt := "  %-22s %5d %7s %8s %8s %8s"
-	if s.Tokens.CostAvailable {
+	if cost {
 		header += " %9s"
 		rowFmt += " %9s"
 	}
 	header += "\n"
 	rowFmt += "\n"
 
-	args := []any{"PHASE", "SESS", "INPUT", "CACHE_W", "CACHE_R", "OUTPUT"}
-	if s.Tokens.CostAvailable {
+	args := []any{"PHASE / model", "SESS", "INPUT", "CACHE_W", "CACHE_R", "OUTPUT"}
+	if cost {
 		args = append(args, "COST")
 	}
 	fmt.Fprintf(w, header, args...)
@@ -902,18 +943,10 @@ func RenderTokens(w io.Writer, s Snapshot) {
 		totCost                             float64
 	)
 	for _, r := range s.Tokens.ByPhase {
-		fields := []any{
-			r.Key, r.Sessions,
-			FormatTokens(r.Usage.InputTokens),
-			FormatTokens(r.Usage.CacheCreationTokens),
-			FormatTokens(r.Usage.CacheReadTokens),
-			FormatTokens(r.Usage.OutputTokens),
+		writeBurnRow(w, rowFmt, r.Key, r, cost)
+		for _, m := range s.Tokens.ByPhaseModel[r.Key] {
+			writeBurnRow(w, rowFmt, "  "+m.Key, m, cost)
 		}
-		if s.Tokens.CostAvailable {
-			fields = append(fields, fmt.Sprintf("$%.2f", r.Cost))
-		}
-		fmt.Fprintf(w, rowFmt, fields...)
-
 		totSess += r.Sessions
 		totIn += r.Usage.InputTokens
 		totCacheW += r.Usage.CacheCreationTokens
@@ -921,20 +954,26 @@ func RenderTokens(w io.Writer, s Snapshot) {
 		totOut += r.Usage.OutputTokens
 		totCost += r.Cost
 	}
-	if len(s.Tokens.ByPhase) == 0 {
-		return
+	total := tokens.Rollup{Sessions: totSess, Cost: totCost, Usage: tokens.Usage{
+		InputTokens: totIn, CacheCreationTokens: totCacheW, CacheReadTokens: totCacheR, OutputTokens: totOut,
+	}}
+	writeBurnRow(w, rowFmt, "TOTAL", total, cost)
+}
+
+// writeBurnRow prints one token-burn row: label in the key column, then
+// the session count and token/cost cells from r.
+func writeBurnRow(w io.Writer, rowFmt, label string, r tokens.Rollup, cost bool) {
+	fields := []any{
+		label, r.Sessions,
+		FormatTokens(r.Usage.InputTokens),
+		FormatTokens(r.Usage.CacheCreationTokens),
+		FormatTokens(r.Usage.CacheReadTokens),
+		FormatTokens(r.Usage.OutputTokens),
 	}
-	totalFields := []any{
-		"TOTAL", totSess,
-		FormatTokens(totIn),
-		FormatTokens(totCacheW),
-		FormatTokens(totCacheR),
-		FormatTokens(totOut),
+	if cost {
+		fields = append(fields, fmt.Sprintf("$%.2f", r.Cost))
 	}
-	if s.Tokens.CostAvailable {
-		totalFields = append(totalFields, fmt.Sprintf("$%.2f", totCost))
-	}
-	fmt.Fprintf(w, rowFmt, totalFields...)
+	fmt.Fprintf(w, rowFmt, fields...)
 }
 
 // ---- helpers -------------------------------------------------------------

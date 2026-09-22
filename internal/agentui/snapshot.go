@@ -162,7 +162,8 @@ type TokensPanel struct {
 	CostAvailable bool // true when at least one session reported its cost
 	ByPhase       []tokens.Rollup
 	ByTask        []tokens.Rollup
-	Note          string // error / "by phase, last 24h" etc.
+	ByPhaseModel  map[string][]tokens.Rollup // phase → per-model breakdown
+	Note          string                     // error / "by phase, last 24h" etc.
 }
 
 // BudgetStat is one pipeline's rolling-budget position: what the config
@@ -703,6 +704,7 @@ func (s *Snapshot) collectTokens(ctx context.Context, opts CollectOptions, cutof
 	s.Tokens.CostAvailable = res.CostAvailable
 	s.Tokens.ByPhase = res.ByPhase
 	s.Tokens.ByTask = res.ByTask
+	s.Tokens.ByPhaseModel = res.ByPhaseModel
 	s.Tokens.Note = fmt.Sprintf("last %s", opts.Since)
 }
 
